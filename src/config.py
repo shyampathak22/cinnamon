@@ -32,6 +32,7 @@ class TrainConfig:
     checkpoint_steps: int = 500
     seed: int = 42 # TIL this is a reference from the hitchhiker's guide to the galaxy! pretty cool!
     peak_flops: float = 23.7e12
+    mtp_lambda: float = 0.3
     @property
     def max_steps(self):
         return self.max_tokens // (self.batch_size * self.seq_len * self.accumulation_steps)

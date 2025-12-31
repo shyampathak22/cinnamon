@@ -101,32 +101,41 @@ class Trainer():
         # split batch into input and target, move to device
         x = batch[:, :-1].to(self.local_rank)
         y = batch[:, 1:].to(self.local_rank)
+        y_mtp = batch[:, 2:].to(self.local_rank)
         with autocast('cuda', dtype=torch.bfloat16):
-            logits = self.model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss = loss / self.config.accumulation_steps
+            main_logits, mtp_logits = self.model(x)
+            main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
+            mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), y_mtp.view(-1))
+            loss = (main_loss + self.config.mtp_lambda * mtp_loss) / self.config.accumulation_steps
         self.grad_scaler.scale(loss).backward()
-        return loss * self.config.accumulation_steps
+        return loss * self.config.accumulation_steps, mtp_loss, main_loss
 
     @torch.no_grad()
     def val_step(self, batch):
         x = batch[:, :-1].to(self.local_rank)
         y = batch[:, 1:].to(self.local_rank)
+        y_mtp = batch[:, 2:].to(self.local_rank)
         with autocast('cuda', dtype=torch.bfloat16):
-            logits = self.model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-        return loss
+            main_logits, mtp_logits = self.model(x)
+            main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
+            mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), y_mtp.view(-1))
+            loss = (main_loss + self.config.mtp_lambda * mtp_loss)
+        return loss, main_loss, mtp_loss
     
     def val(self, num_batches=100):
         losses = []
+        main_losses = []
+        mtp_losses = []
         val_step = 0
         if self.rank == 0:
             pbar = tqdm(total=num_batches, desc=f"Evaluating")
         for i, batch in enumerate(self.val_loader):
             if i >= num_batches:
                 break
-            loss = self.val_step(batch)
+            loss, main_loss, mtp_loss = self.val_step(batch)
             losses.append(loss.item())
+            main_losses.append(main_loss.item())
+            mtp_losses.append(mtp_loss.item())
             val_step += 1
             if self.rank == 0:
                 pbar.update(1)
@@ -134,7 +143,7 @@ class Trainer():
             pbar.close()
         if len(losses) == 0:
             return float('inf')
-        return sum(losses) / len(losses)
+        return sum(losses) / len(losses), sum(main_losses) / len(main_losses), sum(mtp_losses) / len(mtp_losses)
         
     def train(self):
         self.model.train()
@@ -148,7 +157,7 @@ class Trainer():
         while self.step < self.config.max_steps:
             for batch in self.train_loader:
                 start_t = time.perf_counter()
-                loss = self.train_step(batch)
+                loss, mtp_loss, main_loss = self.train_step(batch)
                 end_t = time.perf_counter()
                 accum_time += (end_t - start_t)
                 microstep += 1
@@ -185,15 +194,19 @@ class Trainer():
                                 "train/ema_loss": ema_loss,
                                 "model/lr": self.scheduler.get_last_lr()[0],
                                 "train/step": self.step,
-                                "train/tokens_seen": self.tokens_seen
+                                "train/tokens_seen": self.tokens_seen,
+                                "train/mtp_loss": mtp_loss.item(),
+                                "train/main_loss": main_loss.item()
                                 })
                     if self.step % self.config.eval_steps == 0 and self.step > 0:
                         self.model.eval()
-                        eval_loss = self.val()
+                        eval_loss, eval_main_loss, eval_mtp_loss = self.val()
                         if self.rank == 0:
                             print(f"Eval Perplexity: {math.exp(eval_loss):.4f}")
                         if self.rank == 0:
-                            wandb.log({"eval/eval loss": eval_loss,
+                            wandb.log({"eval/loss": eval_loss,
+                                       "eval/main_loss": eval_main_loss,
+                                       "eval/mtp_loss": eval_mtp_loss,
                                     "eval/perplexity": math.exp(eval_loss)
                                     })
                         self.model.train()

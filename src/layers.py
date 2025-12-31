@@ -83,6 +83,22 @@ class Transformer(nn.Module):
         x = x +  self.moe(self.rms2(x))
         return x
     
+class MultiTokenPrediction(nn.Module):
+    
+    def __init__(self, d_model):
+        super().__init__()
+        self.normh = RMSNorm(d_model)
+        self.normemb = RMSNorm(d_model)
+        self.proj = nn.Linear(2*d_model, d_model, bias=False)
+
+    def forward(self, x, target_emb):
+        x = self.normh(x)
+        y = self.normemb(target_emb)
+        concat = torch.concat((x, y), dim=-1)
+        return self.proj(concat)
+
+
+
 if __name__ == "__main__":
     vocab_size = 50257
     d_model = 512

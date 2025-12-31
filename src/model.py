@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers import Transformer
+from layers import Transformer, MultiTokenPrediction
 from norm import RMSNorm
 
 class Cinnamon(nn.Module):
@@ -36,6 +36,8 @@ class Cinnamon(nn.Module):
         # tie lm_head and embedding weights together (save memory/compute and improve generalization)
         self.lm_head.weight = self.embedding.weight
 
+        self.mtp = MultiTokenPrediction(d_model)
+
         # apply weight inits
         self._init_weights()
 
@@ -51,13 +53,15 @@ class Cinnamon(nn.Module):
                 elif p.dim() >= 2:
                     torch.nn.init.normal_(p, mean=0.0, std=0.02)
 
-    def forward(self, x):
+    def forward(self, input_ids):
         # pass through layers
-        x = self.embedding(x)
+        x = self.embedding(input_ids)
         x = self.transformer_layers(x)
+        x_2 = self.mtp(x[:, :-1], self.embedding(input_ids[:, 1:]))
         x = self.norm(x)
         x = self.lm_head(x)
-        return x
+        x_2 = self.lm_head(self.norm(x_2))
+        return x, x_2
     
 if __name__ == "__main__":
     vocab_size = 50257
@@ -92,6 +96,6 @@ if __name__ == "__main__":
                  expert_scale,
                  gamma)
     x = torch.randint(0, vocab_size, (batch_size, max_seq_len))
-    out= model(x)
-    print(f"output shape: {out.shape}")
+    out, mtp_out = model(x)
+    print(f"output shape: {out.shape}, mtp: {mtp_out.shape}")
     print(f"Total: {sum(p.numel() for p in model.parameters()):,} | Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
