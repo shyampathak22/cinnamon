@@ -17,6 +17,9 @@ from model import Cinnamon
 from config import ModelConfig, TrainConfig
 from dataclasses import asdict
 
+DATA_DIR = Path(__file__).parent.parent / "artifacts" / "tokenized_data"
+CHECKPOINT_DIR = Path(__file__).parent.parent / "artifacts" / "checkpoints"
+
 class ShardedDataset(IterableDataset):
     
     def __init__(self, data_dir, split, seq_len, rank, world_size, seed=42):
@@ -62,9 +65,9 @@ class Trainer():
         self.rank = rank
         self.local_rank = local_rank
         self.world_size = world_size
-        train_dataset = ShardedDataset("artifacts/tokenized_data/", "train", config.seq_len, self.rank, self.world_size, self.seed)
+        train_dataset = ShardedDataset(DATA_DIR, "train", config.seq_len, self.rank, self.world_size, self.seed)
         self.train_loader = DataLoader(train_dataset, batch_size=config.batch_size)
-        val_dataset = ShardedDataset("artifacts/tokenized_data/", "val", config.seq_len, self.rank, self.world_size, self.seed)
+        val_dataset = ShardedDataset(DATA_DIR, "val", config.seq_len, self.rank, self.world_size, self.seed)
         self.val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
         decay_params = [p for p in model.parameters() if p.dim() >= 2]
         no_decay_params = [p for p in model.parameters() if p.dim() < 2]
@@ -79,7 +82,7 @@ class Trainer():
         self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
         self.grad_scaler = torch.GradScaler()
-        Path("artifacts/checkpoints").mkdir(parents=True, exist_ok=True)
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         if self.rank == 0:
             wandb.init(project='cinnamon', config={**asdict(config), **asdict(model_config), "num_params": self.num_params, "max_steps": config.max_steps, "warmup_steps": config.warmup_steps})
 
@@ -224,8 +227,8 @@ class Trainer():
                                 "tokens_seen": self.tokens_seen,
                                 "config": self.config,
                                 "ema_loss": ema_loss
-                            }, f"artifacts/checkpoints/checkpoint_{self.step}.pt")
-                            print(f"saved checkpoint to artifacts/checkpoints/checkpoint_{self.step}.pt")
+                            }, CHECKPOINT_DIR / f"checkpoint_{self.step}.pt")
+                            print(f"saved checkpoint to {CHECKPOINT_DIR / f'checkpoint_{self.step}.pt'}")
                     if self.step >= self.config.max_steps:
                         break
         if self.rank == 0:
