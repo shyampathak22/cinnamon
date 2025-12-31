@@ -143,7 +143,10 @@ class Trainer():
             pbar.close()
         if len(losses) == 0:
             return float('inf')
-        return sum(losses) / len(losses), sum(main_losses) / len(main_losses), sum(mtp_losses) / len(mtp_losses)
+        eval_loss = sum(losses) / len(losses)
+        eval_main_loss = sum(main_losses) / len(main_losses)
+        eval_mtp_loss = sum(mtp_losses) / len(mtp_losses)
+        return eval_loss, eval_main_loss, eval_mtp_loss
         
     def train(self):
         self.model.train()
