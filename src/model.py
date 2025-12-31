@@ -16,12 +16,17 @@ class Cinnamon(nn.Module):
                  d_ckv, 
                  d_cq, 
                  d_head, 
-                 d_rope):
+                 d_rope, 
+                 n_routed, 
+                 n_shared, 
+                 top_k, 
+                 expert_scale,
+                 gamma):
         super().__init__()
         self.n_layers = n_layers
         
         # init nn.Sequential using n_layers to create transformer blocks
-        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope) for _ in range(self.n_layers)])
+        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma) for _ in range(self.n_layers)])
 
         # init embedding, norm, and lm_heads
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -66,7 +71,26 @@ if __name__ == "__main__":
     d_cq=256
     d_head=64
     d_rope=32
-    model = Cinnamon(d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len, d_ckv, d_cq, d_head, d_rope)
+    n_routed=8
+    n_shared=1
+    top_k=2
+    expert_scale=4
+    gamma=0.001
+    model = Cinnamon(d_model,
+                 n_layers,
+                 vocab_size, 
+                 hidden_dim, 
+                 n_heads, 
+                 max_seq_len,
+                 d_ckv, 
+                 d_cq, 
+                 d_head, 
+                 d_rope, 
+                 n_routed, 
+                 n_shared, 
+                 top_k, 
+                 expert_scale,
+                 gamma)
     x = torch.randint(0, vocab_size, (batch_size, max_seq_len))
     out= model(x)
     print(f"output shape: {out.shape}")

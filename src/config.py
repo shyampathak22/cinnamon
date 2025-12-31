@@ -12,6 +12,11 @@ class ModelConfig:
     d_cq: int = 256
     d_head: int = 64
     d_rope: int = 32
+    n_routed: int = 8
+    n_shared: int = 1 
+    top_k: int = 2 
+    expert_scale: int = 4
+    gamma: float = 0.001
 
 @dataclass
 class TrainConfig:

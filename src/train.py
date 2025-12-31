@@ -230,7 +230,12 @@ if __name__ == "__main__":
                      model_config.d_ckv,
                      model_config.d_cq,
                      model_config.d_head,
-                     model_config.d_rope)
+                     model_config.d_rope,
+                     model_config.n_routed, 
+                     model_config.n_shared, 
+                     model_config.top_k, 
+                     model_config.expert_scale,
+                     model_config.gamma)
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)
