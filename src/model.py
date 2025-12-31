@@ -1,0 +1,59 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from layers import Transformer
+from norm import RMSNorm
+
+class Cinnamon(nn.Module):
+
+    def __init__(self, d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len):
+        super().__init__()
+        self.n_layers = n_layers
+        
+        # init nn.Sequential using n_layers to create transformer blocks
+        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads) for _ in range(self.n_layers)])
+
+        # init embedding, norm, and lm_heads
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # tie lm_head and embedding weights together (save memory/compute and improve generalization)
+        self.lm_head.weight = self.embedding.weight
+
+        # apply weight inits
+        self._init_weights()
+
+    def _init_weights(self):
+        for name, p in self.named_parameters():
+            if 'weight' in name:
+                
+                # scale down the residual streams to reduce variance in grads
+                if name.endswith('o.weight') or name.endswith('w3.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / (2*self.n_layers)**0.5)
+
+                # init all others to low value with low std.
+                elif p.dim() >= 2:
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02)
+
+    def forward(self, x):
+        # pass through layers
+        x = self.embedding(x)
+        x = self.transformer_layers(x)
+        x = self.norm(x)
+        x = self.lm_head(x)
+        return x
+    
+if __name__ == "__main__":
+    vocab_size = 50257
+    d_model = 512
+    max_seq_len = 1024
+    batch_size = 32
+    n_heads = 8
+    n_layers = 4
+    hidden_dim = 1024
+    model = Cinnamon(d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len)
+    x = torch.randint(0, vocab_size, (batch_size, max_seq_len))
+    out= model(x)
+    print(f"output shape: {out.shape}")
+    print(f"Total: {sum(p.numel() for p in model.parameters()):,} | Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
