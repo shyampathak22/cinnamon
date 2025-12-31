@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from norm import RMSNorm
-from attention import MultiHeadAttention
+from attention import MultiheadLatentAttention
 
 class SwiGLU(nn.Module):
 
@@ -24,13 +24,13 @@ class SwiGLU(nn.Module):
     
 class Transformer(nn.Module):
 
-    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads):
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope):
         super().__init__()
         
         # init layers
         self.rms1 = RMSNorm(d_model)
         self.rms2 = RMSNorm(d_model)
-        self.mha = MultiHeadAttention(d_model, n_heads, max_seq_len)
+        self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len)
         self.swiglu = SwiGLU(d_model, hidden_dim)
 
     def forward(self, x):
@@ -38,7 +38,7 @@ class Transformer(nn.Module):
         normx = self.rms1(x)
 
         # pass norms to MHA and add to residual stream
-        x = x + self.mha(normx, normx, normx)
+        x = x + self.attn(normx)
         
         # pass norms to SwiGLU and add to residual stream
         x = x +  self.swiglu(self.rms2(x))
@@ -51,6 +51,10 @@ if __name__ == "__main__":
     max_seq_len = 1024
     batch_size = 32
     n_heads = 8
-    transformer = Transformer(d_model, hidden_dim, max_seq_len, n_heads)
+    d_ckv=256
+    d_cq=256
+    d_head=64
+    d_rope=32
+    transformer = Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope)
     x = torch.randn(batch_size, max_seq_len, d_model)
     print(f"output shape: {transformer(x).shape}")

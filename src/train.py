@@ -221,7 +221,16 @@ if __name__ == "__main__":
     model_config = ModelConfig()
     train_config = TrainConfig()
     print("intitializing cinnamon model...")
-    model = Cinnamon(model_config.d_model, model_config.n_layers, model_config.vocab_size, model_config.hidden_dim, model_config.n_heads, model_config.max_seq_len)
+    model = Cinnamon(model_config.d_model,
+                     model_config.n_layers,
+                     model_config.vocab_size,
+                     model_config.hidden_dim,
+                     model_config.n_heads,
+                     model_config.max_seq_len,
+                     model_config.d_ckv,
+                     model_config.d_cq,
+                     model_config.d_head,
+                     model_config.d_rope)
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)

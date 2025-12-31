@@ -6,12 +6,22 @@ from norm import RMSNorm
 
 class Cinnamon(nn.Module):
 
-    def __init__(self, d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len):
+    def __init__(self,
+                 d_model,
+                 n_layers,
+                 vocab_size, 
+                 hidden_dim, 
+                 n_heads, 
+                 max_seq_len,
+                 d_ckv, 
+                 d_cq, 
+                 d_head, 
+                 d_rope):
         super().__init__()
         self.n_layers = n_layers
         
         # init nn.Sequential using n_layers to create transformer blocks
-        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads) for _ in range(self.n_layers)])
+        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope) for _ in range(self.n_layers)])
 
         # init embedding, norm, and lm_heads
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -52,7 +62,11 @@ if __name__ == "__main__":
     n_heads = 8
     n_layers = 4
     hidden_dim = 1024
-    model = Cinnamon(d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len)
+    d_ckv=256
+    d_cq=256
+    d_head=64
+    d_rope=32
+    model = Cinnamon(d_model, n_layers, vocab_size, hidden_dim, n_heads, max_seq_len, d_ckv, d_cq, d_head, d_rope)
     x = torch.randint(0, vocab_size, (batch_size, max_seq_len))
     out= model(x)
     print(f"output shape: {out.shape}")

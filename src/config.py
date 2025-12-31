@@ -8,6 +8,10 @@ class ModelConfig:
     hidden_dim: int = 1408
     n_heads: int = 8
     max_seq_len: int = 1024
+    d_ckv: int = 256
+    d_cq: int = 256
+    d_head: int = 64
+    d_rope: int = 32
 
 @dataclass
 class TrainConfig:
