@@ -17,6 +17,8 @@ class ModelConfig:
     top_k: int = 2 
     expert_scale: int = 4
     gamma: float = 0.001
+    k_ts: int = 256
+    local_window: int = 128
 
 @dataclass
 class TrainConfig:

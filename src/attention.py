@@ -151,18 +151,17 @@ class MultiheadLatentAttention(nn.Module):
         c_kv = self.w_dkv(x)
         I = self.light_sel(x)
         idx = self.tok_sel(I)
-        idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, c_kv.size(-1))
-        c_kv_expanded = c_kv.unsqueeze(1).expand(-1, idx.size(1), -1, -1)
-        ckv_selected = torch.gather(c_kv_expanded, dim=2, index=idx_expanded)
+
+        batch_idx = torch.arange(batch_size, device=x.device)[:, None, None]
+        ckv_selected = c_kv[batch_idx, idx]  # (batch, L, k, d_ckv)
+
         key_c = self.w_uk(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
         value = self.w_uv(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
         c_q = self.w_dq(x)
         query_c = self.w_uq(c_q).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
 
         query_r = self.pope(self.w_qr(c_q).view(batch_size, -1, self.n_head, self.d_rope)).transpose(1, 2)
-        idx_expanded_x = idx.unsqueeze(-1).expand(-1, -1, -1, x.size(-1))
-        x_expanded = x.unsqueeze(1).expand(-1, idx.size(1), -1, -1)
-        x_selected = torch.gather(x_expanded, dim=2, index=idx_expanded_x)
+        x_selected = x[batch_idx, idx]  # (batch, L, k, d_model)
         ker_r_pre = self.w_kr(x_selected)
         key_r = self.pope(ker_r_pre.permute(0, 2, 1, 3))
         key_r = key_r.permute(0, 2, 1, 3)
@@ -209,3 +208,25 @@ if __name__ == "__main__":
     print(f"selected indices shape: {indices.shape}")
     print(f"sample indices for query 0: {indices[0, 0, :10]}")
     print(f"sample indices for query 63: {indices[0, 63, :10]}")
+
+    import time
+
+    # Clear memory from previous tests
+    torch.cuda.empty_cache()
+
+    mla_sparse = MultiheadLatentAttention(
+        d_model=512, d_ckv=256, d_cq=256, n_head=8, d_head=64,
+        d_rope=32, max_seq_len=16384, k_ts=128, local_window=64
+    )
+    mla_sparse.cuda()
+
+    for seq_len in [1024, 2048, 4096]:
+        torch.cuda.empty_cache()
+        x = torch.randn(1, seq_len, 512).cuda()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        out = mla_sparse(x)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        print(f"seq_len={seq_len}: {elapsed*1000:.1f}ms, shape={out.shape}")
+        del x, out

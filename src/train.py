@@ -254,7 +254,9 @@ if __name__ == "__main__":
                      model_config.n_shared, 
                      model_config.top_k, 
                      model_config.expert_scale,
-                     model_config.gamma)
+                     model_config.gamma,
+                     model_config.k_ts,
+                     model_config.local_window)
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)

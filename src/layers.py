@@ -63,13 +63,13 @@ class MoE(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma):
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window):
         super().__init__()
         
         # init layers
         self.rms1 = RMSNorm(d_model)
         self.rms2 = RMSNorm(d_model)
-        self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len)
+        self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len, k_ts, local_window)
         self.moe = MoE(n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma)
 
     def forward(self, x):
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     d_model = 512
     hidden_dim = 2048
     max_seq_len = 1024
-    batch_size = 32
+    batch_size = 4
     n_heads = 8
     d_ckv=256
     d_cq=256
@@ -115,7 +115,9 @@ if __name__ == "__main__":
     top_k=2
     expert_scale=4
     gamma=0.001
-    transformer = Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma)
+    k_ts=256
+    local_window=128
+    transformer = Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window)
     x = torch.randn(batch_size, max_seq_len, d_model)
     print(f"output shape: {transformer(x).shape}")
     moe = MoE(n_routed=8, n_shared=1, top_k=2, d_model=512, hidden_dim=2048, expert_scale=4, gamma=0.001)
