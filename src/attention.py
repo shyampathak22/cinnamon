@@ -34,17 +34,18 @@ class PoPE(nn.Module):
         self.register_buffer('theta', 1 / (base**(2*(torch.arange(0, d_k//2)) / d_k)))
 
         # create range of pos indices
-        self.register_buffer('pos', torch.arange(max_seq_len))
 
-        self.delta = nn.Parameter(torch.zeros(d_k // 2))
+        self.raw_delta = nn.Parameter(torch.zeros(d_k // 2))
 
     def forward(self, x):
-        angles = torch.outer(self.pos, self.theta).unsqueeze(0).unsqueeze(2)
-        cos = (angles + self.delta).cos()
-        sin = (angles + self.delta).sin()
+        delta = -2 * torch.pi * torch.sigmoid(self.raw_delta)
+        pos = torch.arange(x.size(1), device=x.device)
+        angles = torch.outer(pos, self.theta).unsqueeze(0).unsqueeze(2)
+        cos = (angles + delta).cos()
+        sin = (angles + delta).sin()
         mu1, mu2 = torch.chunk(F.softplus(x), 2, dim=-1)
-        x1 = mu1 * cos[:, :mu1.size(1)] - mu2 * sin[:, :mu2.size(1)]
-        x2 = mu1 * sin[:, :mu1.size(1)] + mu2 * cos[:, :mu2.size(1)]
+        x1 = mu1 * cos - mu2 * sin
+        x2 = mu1 * sin + mu2 * cos
         return torch.concat((x1, x2), dim=-1)
 
 class MultiHeadAttention(nn.Module):
@@ -65,24 +66,6 @@ class MultiHeadAttention(nn.Module):
 
         # init RoPE class
         self.rope = RoPE(self.d_k, self.max_seq_len)
-
-    # def sdpa(self, query, key, value, attn_mask="causal"):
-    #     # calculate Q @ K^T  scores, apply scale to prevent dot products from becoming too large in high dims
-    #     # Q @ K^T scores represent the similarity between each token and all other tokens in the sequence
-    #     scores = (query @ key.transpose(-2, -1)) / self.d_k**0.5
-
-    #     # apply causal attention mask using upper traingualr matrix, prevent looking ahead in seqeuence
-    #     if attn_mask == "causal":
-    #         scores = scores.masked_fill(torch.triu(torch.ones_like(scores), diagonal=1).bool(), float('-inf'))
-
-    #     # calculate softmax and apply dropout
-    #     attn_qk = F.softmax(scores, dim=-1)
-    #     attn_qk = self.dropout(attn_qk)
-
-    #     # calculate QK^T @ V scores
-    #     # this weighs output information (V) based on the similarity score calculated above (Q @ K^T)
-    #     attn = attn_qk @ value
-    #     return attn
     
     def forward(self, query, key, value, attn_mask=None):
         # calculate batch size by finding number of queries
@@ -98,6 +81,24 @@ class MultiHeadAttention(nn.Module):
         out = self.o(attn_o)
         return out
     
+class LightningIndexer(nn.Module):
+    def  __init__(self, d_model, n_head, d_head):
+        super().__init__()
+        self.n_head = n_head
+        self.d_head = d_head
+        self.w_q = nn.Linear(d_model, n_head * d_head, bias=False)
+        self.w_k = nn.Linear(d_model, d_head, bias=False)
+        self.w = nn.Parameter(torch.ones(n_head))
+
+    def forward(self, h):
+        batch, seq, _ = h.shape
+
+        q = self.w_q(h).view(batch, seq, self.n_head, self.d_head)
+        k = self.w_k(h)
+        scores = F.relu(torch.einsum('bthd,bsd->bths', q, k))
+        I = torch.einsum('bths,h->bts', scores, self.w)
+        return I
+
 class MultiheadLatentAttention(nn.Module):
     def __init__(self, d_model, d_ckv, d_cq, n_head, d_head, d_rope, max_seq_len):
         super().__init__()
@@ -130,14 +131,6 @@ class MultiheadLatentAttention(nn.Module):
 
         attn_o = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=(self.d_head + self.d_rope)**-0.5).transpose(1, 2).reshape(batch_size, -1, self.d_head*self.n_head)
         return self.w_out(attn_o)
-
-
-
-
-
-
-
-
     
 if __name__ == "__main__":
     vocab_size = 50257
@@ -156,3 +149,18 @@ if __name__ == "__main__":
     x = torch.randn(4, 128, 512)
     out = mla(x)
     print(f"mla output shape: {out.shape}")
+    pope = PoPE(32, 1024)
+    pope.cuda()
+    x_short = torch.randn(4, 1024, 1, 32).cuda()
+    out_short = pope(x_short)
+    print(f"train length (1024): {out_short.shape}")
+    x_long = torch.randn(4, 4096, 1, 32).cuda()
+    out_long = pope(x_long)
+    print(f"4x extrapolation (4096): {out_long.shape}")
+    x_longer = torch.randn(4, 16384, 1, 32).cuda()
+    out_longer = pope(x_longer)
+    print(f"16x extrapolation (16384): {out_longer.shape}")
+    indexer = LightningIndexer(d_model=512, n_head=8, d_head=64)
+    h = torch.randn(4, 128, 512)
+    relevance = indexer(h)
+    print(f"Relevance shape: {relevance.shape}")
