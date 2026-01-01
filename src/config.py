@@ -13,12 +13,16 @@ class ModelConfig:
     d_head: int = 64
     d_rope: int = 32
     n_routed: int = 8
-    n_shared: int = 1 
-    top_k: int = 2 
+    n_shared: int = 1
+    top_k: int = 2
     expert_scale: int = 4
     gamma: float = 0.001
-    k_ts: int = 256
-    local_window: int = 128
+    k_ts: int = 64  # reduced from 256 - 64/1024 = 6.25% sparsity is more efficient
+    local_window: int = 64  # reduced to match k_ts
+    n_indexer_heads: int = 2  # DeepSeek V3.2 uses small head count for indexer
+    # Normalization and positional encoding
+    rms_eps: float = 1e-6
+    rope_base: float = 10000.0
 
 @dataclass
 class TrainConfig:
@@ -32,9 +36,15 @@ class TrainConfig:
     eval_steps: int = 100
     log_steps: int = 5
     checkpoint_steps: int = 500
-    seed: int = 42 # TIL this is a reference from the hitchhiker's guide to the galaxy! pretty cool!
+    seed: int = 42  # TIL this is a reference from the hitchhiker's guide to the galaxy!
     peak_flops: float = 23.7e12
     mtp_lambda: float = 0.3
+    # DataLoader settings
+    num_workers: int = 4
+    pin_memory: bool = True
+    prefetch_factor: int = 2
+    # FP8 training (requires SM89+ for compute benefits, otherwise storage-only)
+    use_fp8: bool = True
     @property
     def max_steps(self):
         return self.max_tokens // (self.batch_size * self.seq_len * self.accumulation_steps)

@@ -9,36 +9,39 @@ class Cinnamon(nn.Module):
     def __init__(self,
                  d_model,
                  n_layers,
-                 vocab_size, 
-                 hidden_dim, 
-                 n_heads, 
+                 vocab_size,
+                 hidden_dim,
+                 n_heads,
                  max_seq_len,
-                 d_ckv, 
-                 d_cq, 
-                 d_head, 
-                 d_rope, 
-                 n_routed, 
-                 n_shared, 
-                 top_k, 
+                 d_ckv,
+                 d_cq,
+                 d_head,
+                 d_rope,
+                 n_routed,
+                 n_shared,
+                 top_k,
                  expert_scale,
                  gamma,
                  k_ts,
-                 local_window):
+                 local_window,
+                 n_indexer_heads,
+                 rms_eps,
+                 rope_base):
         super().__init__()
         self.n_layers = n_layers
-        
+
         # init nn.Sequential using n_layers to create transformer blocks
-        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window) for _ in range(self.n_layers)])
+        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base) for _ in range(self.n_layers)])
 
         # init embedding, norm, and lm_heads
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.norm = RMSNorm(d_model)
+        self.norm = RMSNorm(d_model, eps=rms_eps)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         # tie lm_head and embedding weights together (save memory/compute and improve generalization)
         self.lm_head.weight = self.embedding.weight
 
-        self.mtp = MultiTokenPrediction(d_model)
+        self.mtp = MultiTokenPrediction(d_model, rms_eps)
 
         # apply weight inits
         self._init_weights()
@@ -46,62 +49,38 @@ class Cinnamon(nn.Module):
     def _init_weights(self):
         for name, p in self.named_parameters():
             if 'weight' in name:
-                
-                # scale down the residual streams to reduce variance in grads
-                if name.endswith('o.weight') or name.endswith('w3.weight'):
+                # Scale down residual stream projections to reduce variance in grads
+                # w_out: MLA output projection, w3: SwiGLU down projection
+                if name.endswith('w_out.weight') or name.endswith('w3.weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=0.02 / (2*self.n_layers)**0.5)
-
-                # init all others to low value with low std.
+                # Standard init for all other weights
                 elif p.dim() >= 2:
                     torch.nn.init.normal_(p, mean=0.0, std=0.02)
 
     def forward(self, input_ids):
-        # pass through layers
-        x = self.embedding(input_ids)
-        x = self.transformer_layers(x)
-        x_2 = self.mtp(x[:, :-1], self.embedding(input_ids[:, 1:]))
-        x = self.norm(x)
-        x = self.lm_head(x)
-        x_2 = self.lm_head(self.norm(x_2))
+        # embed once, reuse for MTP (avoid redundant embedding lookup)
+        emb = self.embedding(input_ids)
+        x = self.transformer_layers(emb)
+        x_2 = self.mtp(x[:, :-1], emb[:, 1:])  # reuse embeddings instead of re-embedding
+
+        # Batch LM head calls: single norm + linear pass
+        seq_len_main, seq_len_mtp = x.size(1), x_2.size(1)
+        combined = torch.cat([x, x_2], dim=1)
+        combined = self.lm_head(self.norm(combined))
+        x, x_2 = combined[:, :seq_len_main], combined[:, seq_len_main:]
         return x, x_2
     
 if __name__ == "__main__":
-    vocab_size = 50257
-    d_model = 512
-    max_seq_len = 1024
-    batch_size = 32
-    n_heads = 8
-    n_layers = 4
-    hidden_dim = 1024
-    d_ckv=256
-    d_cq=256
-    d_head=64
-    d_rope=32
-    n_routed=8
-    n_shared=1
-    top_k=2
-    expert_scale=4
-    gamma=0.001
-    k_ts=256
-    local_window=128
-    model = Cinnamon(d_model,
-                 n_layers,
-                 vocab_size, 
-                 hidden_dim, 
-                 n_heads, 
-                 max_seq_len,
-                 d_ckv, 
-                 d_cq, 
-                 d_head, 
-                 d_rope, 
-                 n_routed, 
-                 n_shared, 
-                 top_k, 
-                 expert_scale,
-                 gamma,
-                 k_ts,
-                 local_window)
-    x = torch.randint(0, vocab_size, (batch_size, max_seq_len))
+    from config import ModelConfig
+    cfg = ModelConfig()
+    cfg.n_layers = 4  # reduced for testing
+    model = Cinnamon(
+        cfg.d_model, cfg.n_layers, cfg.vocab_size, cfg.hidden_dim, cfg.n_heads,
+        cfg.max_seq_len, cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_rope,
+        cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
+        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base
+    )
+    x = torch.randint(0, cfg.vocab_size, (4, cfg.max_seq_len))
     out, mtp_out = model(x)
     print(f"output shape: {out.shape}, mtp: {mtp_out.shape}")
     print(f"Total: {sum(p.numel() for p in model.parameters()):,} | Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")

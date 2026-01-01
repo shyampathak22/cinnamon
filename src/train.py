@@ -66,9 +66,21 @@ class Trainer():
         self.local_rank = local_rank
         self.world_size = world_size
         train_dataset = ShardedDataset(DATA_DIR, "train", config.seq_len, self.rank, self.world_size, self.seed)
-        self.train_loader = DataLoader(train_dataset, batch_size=config.batch_size)
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None
+        )
         val_dataset = ShardedDataset(DATA_DIR, "val", config.seq_len, self.rank, self.world_size, self.seed)
-        self.val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None
+        )
         decay_params = [p for p in model.parameters() if p.dim() >= 2]
         no_decay_params = [p for p in model.parameters() if p.dim() < 2]
         self.optimizer = torch.optim.AdamW([
@@ -81,7 +93,7 @@ class Trainer():
         self.num_params = sum(p.numel() for p in self.model.parameters())
         self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
-        self.grad_scaler = torch.GradScaler()
+        # Note: GradScaler removed - not needed for BF16 (only for FP16)
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         if self.rank == 0:
             wandb.init(project='cinnamon', config={**asdict(config), **asdict(model_config), "num_params": self.num_params, "max_steps": config.max_steps, "warmup_steps": config.warmup_steps})
@@ -101,23 +113,26 @@ class Trainer():
         return lr_lambda
     
     def train_step(self, batch):
-        # split batch into input and target, move to device
-        x = batch[:, :-1].to(self.local_rank)
-        y = batch[:, 1:].to(self.local_rank)
-        y_mtp = batch[:, 2:].to(self.local_rank)
+        # Transfer once, then slice (avoids 3 separate H2D transfers)
+        batch = batch.to(self.local_rank, non_blocking=True)
+        x, y, y_mtp = batch[:, :-1], batch[:, 1:], batch[:, 2:]
+
         with autocast('cuda', dtype=torch.bfloat16):
             main_logits, mtp_logits = self.model(x)
             main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
             mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), y_mtp.view(-1))
             loss = (main_loss + self.config.mtp_lambda * mtp_loss) / self.config.accumulation_steps
-        self.grad_scaler.scale(loss).backward()
+
+        # BF16 doesn't need GradScaler - direct backward
+        loss.backward()
         return loss * self.config.accumulation_steps, mtp_loss, main_loss
 
     @torch.no_grad()
     def val_step(self, batch):
-        x = batch[:, :-1].to(self.local_rank)
-        y = batch[:, 1:].to(self.local_rank)
-        y_mtp = batch[:, 2:].to(self.local_rank)
+        # Transfer once, then slice
+        batch = batch.to(self.local_rank, non_blocking=True)
+        x, y, y_mtp = batch[:, :-1], batch[:, 1:], batch[:, 2:]
+
         with autocast('cuda', dtype=torch.bfloat16):
             main_logits, mtp_logits = self.model(x)
             main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
@@ -169,12 +184,10 @@ class Trainer():
                 microstep += 1
                 self.tokens_seen += batch.size(0) * self.config.seq_len
                 if microstep % self.config.accumulation_steps == 0:
-                    self.grad_scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip)
-                    self.grad_scaler.step(self.optimizer)
-                    self.grad_scaler.update()
+                    self.optimizer.step()
                     self.scheduler.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     self.step += 1
                     if self.rank == 0:
                         pbar.update(1)
@@ -250,13 +263,21 @@ if __name__ == "__main__":
                      model_config.d_cq,
                      model_config.d_head,
                      model_config.d_rope,
-                     model_config.n_routed, 
-                     model_config.n_shared, 
-                     model_config.top_k, 
+                     model_config.n_routed,
+                     model_config.n_shared,
+                     model_config.top_k,
                      model_config.expert_scale,
                      model_config.gamma,
                      model_config.k_ts,
-                     model_config.local_window)
+                     model_config.local_window,
+                     model_config.n_indexer_heads,
+                     model_config.rms_eps,
+                     model_config.rope_base)
+    if train_config.use_fp8:
+        from kernels import convert_to_fp8
+        model = convert_to_fp8(model)
+        if rank == 0:
+            print("FP8 training enabled (SM89+ for compute benefits, otherwise storage-only)")
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)
