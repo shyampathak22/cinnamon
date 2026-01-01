@@ -226,7 +226,7 @@ class Trainer():
                         self.model.eval()
                         eval_loss, eval_main_loss, eval_mtp_loss = self.val()
                         if self.rank == 0:
-                            print(f"Eval Perplexity: {math.exp(eval_loss):.4f}")
+                            print(f"Eval Perplexity: {math.exp(eval_main_loss):.4f}")
                         if self.rank == 0:
                             wandb.log({"eval/loss": eval_loss,
                                        "eval/main_loss": eval_main_loss,
