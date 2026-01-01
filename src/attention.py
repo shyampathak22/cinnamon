@@ -129,7 +129,9 @@ class MultiheadLatentAttention(nn.Module):
 
     def sparse_attention(self, query, key, value, scale):
         scores = torch.einsum('bhld,bhlkd->bhlk', query, key) * scale
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
+        # Cast back to value dtype for einsum compatibility
+        attn_weights = attn_weights.to(value.dtype)
         output = torch.einsum('bhlk,bhlkd->bhld', attn_weights, value)
         return output
 

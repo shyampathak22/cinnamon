@@ -1,6 +1,11 @@
 import torch
 import torch.nn
 import torch.nn.functional as F
+import logging
+
+# Silence spammy torch.compile warnings
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 from torch.utils.data import IterableDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -119,8 +124,8 @@ class Trainer():
 
         with autocast('cuda', dtype=torch.bfloat16):
             main_logits, mtp_logits = self.model(x)
-            main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
-            mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), y_mtp.view(-1))
+            main_loss = F.cross_entropy(main_logits.reshape(-1, main_logits.size(-1)), y.reshape(-1))
+            mtp_loss = F.cross_entropy(mtp_logits.reshape(-1, mtp_logits.size(-1)), y_mtp.reshape(-1))
             loss = (main_loss + self.config.mtp_lambda * mtp_loss) / self.config.accumulation_steps
 
         # BF16 doesn't need GradScaler - direct backward
@@ -135,8 +140,8 @@ class Trainer():
 
         with autocast('cuda', dtype=torch.bfloat16):
             main_logits, mtp_logits = self.model(x)
-            main_loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), y.view(-1))
-            mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), y_mtp.view(-1))
+            main_loss = F.cross_entropy(main_logits.reshape(-1, main_logits.size(-1)), y.reshape(-1))
+            mtp_loss = F.cross_entropy(mtp_logits.reshape(-1, mtp_logits.size(-1)), y_mtp.reshape(-1))
             loss = (main_loss + self.config.mtp_lambda * mtp_loss)
         return loss, main_loss, mtp_loss
     
@@ -160,7 +165,7 @@ class Trainer():
         if self.rank == 0:
             pbar.close()
         if len(losses) == 0:
-            return float('inf')
+            return float('inf'), float('inf'), float('inf')
         eval_loss = sum(losses) / len(losses)
         eval_main_loss = sum(main_losses) / len(main_losses)
         eval_mtp_loss = sum(mtp_losses) / len(mtp_losses)
@@ -280,7 +285,7 @@ if __name__ == "__main__":
             print("FP8 training enabled (SM89+ for compute benefits, otherwise storage-only)")
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank])
-    model = torch.compile(model)
+    model = torch.compile(model)  # Default mode works best with DDP + MoE
     if rank == 0:
         print("initializing trainer...")
     trainer = Trainer(model, train_config, model_config, rank, local_rank, world_size)

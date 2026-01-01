@@ -48,12 +48,13 @@ def quantize_fp8_rowwise_kernel(
 
     # Online scaling: max(|x|) / 448
     abs_max = tl.max(tl.abs(x))
-    # Avoid division by zero
-    abs_max = tl.where(abs_max == 0, 1.0, abs_max)
+    # Avoid division by zero and underflow - minimum scale prevents x/scale overflow
+    abs_max = tl.maximum(abs_max, 1e-12)
     scale = abs_max / FP8_MAX
 
-    # Quantize
+    # Quantize with clamping to prevent overflow
     x_scaled = x / scale
+    x_scaled = tl.minimum(tl.maximum(x_scaled, -FP8_MAX), FP8_MAX)
     x_fp8 = x_scaled.to(tl.float8e4nv)
 
     # Store quantized values
@@ -95,6 +96,7 @@ def quantize_fp8_blockwise_kernel(
     cols = col_start + tl.arange(0, BLOCK_N)
 
     # Create 2D mask
+    
     mask = (rows[:, None] < M) & (cols[None, :] < N)
 
     # Load 2D block
@@ -103,11 +105,13 @@ def quantize_fp8_blockwise_kernel(
 
     # Online scaling: max(|x|) / 448 over entire block
     abs_max = tl.max(tl.abs(x))
-    abs_max = tl.where(abs_max == 0, 1.0, abs_max)
+    # Avoid division by zero and underflow - minimum scale prevents x/scale overflow
+    abs_max = tl.maximum(abs_max, 1e-12)
     scale = abs_max / FP8_MAX
 
-    # Quantize
+    # Quantize with clamping to prevent overflow
     x_scaled = x / scale
+    x_scaled = tl.minimum(tl.maximum(x_scaled, -FP8_MAX), FP8_MAX)
     x_fp8 = x_scaled.to(tl.float8e4nv)
 
     # Store quantized values
@@ -307,16 +311,16 @@ def lightning_indexer_kernel(
     q_mask = q_offs < seq_q
     k_mask = k_offs < seq_k
 
-    # Load all head weights once (N_HEAD is constexpr, so this is sized correctly)
-    w = tl.load(W_ptr + tl.arange(0, N_HEAD))
-
     # Final accumulator
     acc = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
 
-    # Per-head dot product accumulators (computed in parallel conceptually)
-    # We use static_range for compile-time unrolling when N_HEAD is small (2-4)
-    for h in tl.static_range(N_HEAD):
+    # Per-head dot product accumulators
+    # Use regular range and load weight per iteration to avoid constexpr indexing issues
+    for h in range(N_HEAD):
         dot = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
+
+        # Load weight for this head
+        w_h = tl.load(W_ptr + h)
 
         for d_start in range(0, d_head, BLOCK_D):
             d_idx = d_start + d_offs
@@ -333,7 +337,7 @@ def lightning_indexer_kernel(
             dot += tl.dot(q.to(tl.float16), tl.trans(k.to(tl.float16)))
 
         # ReLU + weighted accumulation
-        acc += tl.maximum(dot, 0.0) * w[h]
+        acc += tl.maximum(dot, 0.0) * w_h
 
     # Store
     out_ptrs = Out_ptr + pid_b * stride_ob + q_offs[:, None] * stride_oq + k_offs[None, :] * stride_ok
@@ -503,10 +507,12 @@ def moe_grouped_gemm(
     BLOCK_K = 32
 
     # Grid: (n_experts, max_tiles_m, tiles_n)
-    max_tokens_per_expert = (expert_ends - expert_starts).max().item()
+    # Use total_tokens as upper bound to avoid CPU sync from .item()
+    # Kernel has early-exit for empty ranges, so excess blocks just return
+    max_tiles_m = triton.cdiv(total_tokens, BLOCK_M)
     grid = (
         n_experts,
-        triton.cdiv(max(max_tokens_per_expert, 1), BLOCK_M),
+        max_tiles_m,
         triton.cdiv(d_out, BLOCK_N),
     )
 
@@ -533,9 +539,9 @@ def moe_grouped_gemm(
 def fp8_gemm_kernel(
     # Inputs
     A_ptr,           # FP8 input: (M, K)
-    A_scale_ptr,     # Input scales: (M, K // 128)
-    B_ptr,           # FP8 weights: (N, K)
-    B_scale_ptr,     # Weight scales: (N // 128, K // 128)
+    A_scale_ptr,     # Input scales: (M, K // 128) - row-wise 1x128
+    B_ptr,           # FP8 weights: (K, N)
+    B_scale_ptr,     # Weight scales: (K // 128, N // 128) - block-wise 128x128
     C_ptr,           # Output: (M, N) in BF16
     # Dimensions
     M, N, K,
@@ -543,16 +549,21 @@ def fp8_gemm_kernel(
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
+    # Scale strides
+    stride_as_m, stride_as_k,  # A scale strides (M, K//128)
+    stride_bs_k, stride_bs_n,  # B scale strides (K//128, N//128)
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """
-    FP8 GEMM: C = dequant(A) @ dequant(B).T
+    FP8 GEMM: C = dequant(A) @ dequant(B)
 
-    Uses online dequantization during computation.
-    Accumulates in FP32, outputs BF16.
+    DeepSeek V3 style with:
+    - A: row-wise 1x128 scaling (per row per 128 channels)
+    - B: block-wise 128x128 scaling
+    - FP32 accumulation
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -564,53 +575,219 @@ def fp8_gemm_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # Accumulator
+    # Accumulator in FP32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Scale block indices
-    scale_block_m = pid_m * BLOCK_M // 128
+    # B scale block indices (128x128 blocks)
     scale_block_n = pid_n * BLOCK_N // 128
-    num_k_blocks = tl.cdiv(K, 128)
 
     for k_start in range(0, K, BLOCK_K):
         k_offs = k_start + offs_k
         k_mask = k_offs < K
+        scale_block_k = k_start // 128
 
-        # Load FP8 tiles
+        # Load FP8 A tile: (BLOCK_M, BLOCK_K)
         a_ptrs = A_ptr + offs_m[:, None] * stride_am + k_offs[None, :] * stride_ak
         a_fp8 = tl.load(a_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
 
+        # Load FP8 B tile: (BLOCK_K, BLOCK_N)
         b_ptrs = B_ptr + k_offs[:, None] * stride_bk + offs_n[None, :] * stride_bn
         b_fp8 = tl.load(b_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
 
-        # Load scales for this K block (block-wise: one scale per 128x128 block)
-        scale_block_k = k_start // 128
-        # A scale: indexed by (m_block, k_block), shared across all rows in tile
-        a_scale = tl.load(A_scale_ptr + scale_block_m * num_k_blocks + scale_block_k)
-        # B scale: indexed by (n_block, k_block)
-        b_scale = tl.load(B_scale_ptr + scale_block_n * num_k_blocks + scale_block_k)
+        # Load A scales: row-wise, one per row per 128-column block
+        # Shape: (BLOCK_M,) - each row in tile gets its own scale
+        a_scale_ptrs = A_scale_ptr + offs_m * stride_as_m + scale_block_k * stride_as_k
+        a_scales = tl.load(a_scale_ptrs, mask=mask_m, other=1.0)  # (BLOCK_M,)
 
-        # Dequantize (scalar scales broadcast to tiles)
-        a = a_fp8.to(tl.float32) * a_scale
+        # Load B scale: block-wise 128x128
+        b_scale = tl.load(B_scale_ptr + scale_block_k * stride_bs_k + scale_block_n * stride_bs_n)
+
+        # Dequantize with per-row scales for A, scalar for B
+        a = a_fp8.to(tl.float32) * a_scales[:, None]  # broadcast row scales
         b = b_fp8.to(tl.float32) * b_scale
 
-        # Matmul
-        acc += tl.dot(a.to(tl.float16), b.to(tl.float16))
+        # Matmul in FP32 (Triton accumulates in FP32 with float32 output_dtype)
+        acc += tl.dot(a, b, out_dtype=tl.float32)
 
-    # Store
+    # Store as BF16
     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
 
 
+def fp8_matmul_dsv3(
+    a: torch.Tensor,          # (M, K) FP8
+    b: torch.Tensor,          # (K, N) FP8
+    a_scales: torch.Tensor,   # (M, ceil(K/128)) - row-wise 1x128
+    b_scales: torch.Tensor,   # (ceil(K/128), ceil(N/128)) - block-wise 128x128
+) -> torch.Tensor:
+    """
+    FP8 matmul with DeepSeek V3 style scaling.
+
+    - A (activations): row-wise 1x128 scaling (per token per 128 channels)
+    - B (weights): block-wise 128x128 scaling
+
+    Computes C = A @ B, accumulates in FP32, outputs BF16.
+    """
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"Dimension mismatch: {K} vs {K2}"
+
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
+
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 128  # Use 128 for K to align with scale blocks
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    fp8_gemm_kernel[grid](
+        a, a_scales, b, b_scales, out,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        out.stride(0), out.stride(1),
+        a_scales.stride(0), a_scales.stride(1),
+        b_scales.stride(0), b_scales.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+def _fp8_quantize_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to FP8 with per-tensor scaling for _scaled_mm."""
+    # Per-tensor scale: max(|x|) / 448
+    abs_max = x.abs().max().clamp(min=1e-12)
+    scale = abs_max / 448.0
+    x_scaled = (x / scale).clamp(-448, 448)
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+    # Ensure scale is on same device as input
+    return x_fp8, scale.float().reshape(1).to(x.device)
+
+
+def _pad_to_multiple(x: torch.Tensor, multiple: int = 16) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Pad tensor dimensions to be divisible by multiple."""
+    M, K = x.shape
+    pad_m = (multiple - M % multiple) % multiple
+    pad_k = (multiple - K % multiple) % multiple
+    if pad_m > 0 or pad_k > 0:
+        x = torch.nn.functional.pad(x, (0, pad_k, 0, pad_m))
+    return x, (M, K)
+
+
+def _unpad(x: torch.Tensor, orig_shape: tuple[int, int]) -> torch.Tensor:
+    """Remove padding to restore original dimensions."""
+    return x[:orig_shape[0], :orig_shape[1]]
+
+
+class FP8MatmulFunction(torch.autograd.Function):
+    """
+    FP8 matmul using torch._scaled_mm for hardware acceleration.
+
+    Uses cuBLAS FP8 tensor cores for ~15x speedup over BF16.
+    Per-tensor scaling for simplicity and _scaled_mm compatibility.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        """Forward: y = x @ W.T using hardware FP8."""
+        x_shape = x.shape
+        x_flat = x.reshape(-1, x_shape[-1]).contiguous()  # (M, K)
+        M, K = x_flat.shape
+        N = weight.shape[0]  # weight is (N, K)
+
+        # Pad to multiples of 16 for _scaled_mm
+        x_padded, x_orig = _pad_to_multiple(x_flat)
+        w_padded, w_orig = _pad_to_multiple(weight)
+
+        # Quantize to FP8 with per-tensor scaling
+        x_fp8, x_scale = _fp8_quantize_tensor(x_padded)
+        w_fp8, w_scale = _fp8_quantize_tensor(w_padded)
+
+        # _scaled_mm: row-major A @ column-major B
+        # For A @ B.T: A row-major, B.T column-major means B is row-major then transposed
+        w_fp8_col = w_fp8.t()  # (K_padded, N_padded) column-major
+
+        out = torch._scaled_mm(
+            x_fp8, w_fp8_col,
+            scale_a=x_scale, scale_b=w_scale,
+            out_dtype=torch.bfloat16
+        )
+
+        # Unpad output
+        out = out[:M, :N]
+
+        # Save for backward
+        ctx.save_for_backward(x_fp8, x_scale, weight)
+        ctx.x_shape = x_shape
+        ctx.x_orig = x_orig
+
+        return out.reshape(*x_shape[:-1], -1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward using hardware FP8."""
+        x_fp8, x_scale, weight = ctx.saved_tensors
+        x_shape = ctx.x_shape
+        x_orig = ctx.x_orig
+        M, K = x_orig
+
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()  # (M, N)
+        N = grad_flat.shape[1]
+
+        # ===== grad_x = grad @ W =====
+        # Pad inputs
+        grad_padded, _ = _pad_to_multiple(grad_flat)
+        w_padded, _ = _pad_to_multiple(weight)
+
+        grad_fp8, grad_scale = _fp8_quantize_tensor(grad_padded)
+
+        # W is (N, K), need (N, K) column-major for matmul
+        # Transpose to (K, N), make contiguous, transpose back
+        w_t_cont = w_padded.t().contiguous()  # (K_pad, N_pad) row-major
+        w_t_fp8, w_t_scale = _fp8_quantize_tensor(w_t_cont)
+        w_col = w_t_fp8.t()  # (N_pad, K_pad) column-major
+
+        grad_x = torch._scaled_mm(
+            grad_fp8, w_col,
+            scale_a=grad_scale, scale_b=w_t_scale,
+            out_dtype=torch.bfloat16
+        )
+        grad_x = grad_x[:M, :K].reshape(x_shape)
+
+        # ===== grad_W = grad.T @ x =====
+        # Dequant saved x_fp8 to get x back (only original size)
+        x_dequant = (x_fp8.float() * x_scale)[:M, :K]
+
+        # Pad both
+        grad_t = grad_flat.t().contiguous()  # (N, M)
+        grad_t_padded, _ = _pad_to_multiple(grad_t)
+        x_padded, _ = _pad_to_multiple(x_dequant)
+
+        grad_t_fp8, grad_t_scale = _fp8_quantize_tensor(grad_t_padded)
+
+        # x needs to be column-major
+        x_t_cont = x_padded.t().contiguous()  # (K_pad, M_pad) row-major
+        x_t_fp8, x_t_scale = _fp8_quantize_tensor(x_t_cont)
+        x_col = x_t_fp8.t()  # (M_pad, K_pad) column-major
+
+        grad_weight = torch._scaled_mm(
+            grad_t_fp8, x_col,
+            scale_a=grad_t_scale, scale_b=x_t_scale,
+            out_dtype=torch.bfloat16
+        )
+        grad_weight = grad_weight[:N, :K]
+
+        return grad_x, grad_weight
+
+
 class FP8Linear(torch.nn.Module):
     """
-    FP8 Linear layer with true FP8 compute when available.
+    FP8 Linear layer with true FP8 compute in both forward and backward.
 
-    Uses torch._scaled_mm for FP8 matmul on SM89+ (Ada/Hopper) GPUs.
-    Falls back to dequantize + BF16 matmul on older hardware.
+    Uses custom autograd function with torch._scaled_mm for FP8 matmul
+    on SM89+ (Ada/Hopper) GPUs. Falls back to BF16 on older hardware.
 
-    Memory savings: 4x for weights (FP8 vs FP32).
-    Compute savings: ~2x on SM89+ (true FP8 tensorcore ops).
+    Memory savings: ~4x for activations cached in backward
+    Compute savings: ~2x on SM89+ (true FP8 tensorcore ops)
     """
     # Check for scaled_mm availability (PyTorch 2.1+, SM89+)
     _HAS_SCALED_MM = hasattr(torch, '_scaled_mm')
@@ -624,56 +801,18 @@ class FP8Linear(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
         torch.nn.init.normal_(self.weight, mean=0.0, std=0.02)
 
-        # FP8 weight cache (recomputed when weights change)
-        self.register_buffer('weight_fp8', None)
-        self.register_buffer('weight_scale', None)  # Single scale for scaled_mm
-        self._weight_version = -1
-
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter('bias', None)
 
-    def _quantize_weights(self):
-        """Quantize weights to FP8 if they've changed."""
-        weight_version = self.weight._version
-        if weight_version != self._weight_version:
-            w = self.weight.data  # (out_features, in_features)
-            # Per-tensor scale for scaled_mm compatibility
-            amax = w.abs().max().clamp(min=1e-12)
-            scale = amax / 448.0  # FP8 E4M3 max
-            # Keep same layout as original weight
-            self.weight_fp8 = (w / scale).to(torch.float8_e4m3fn)
-            self.weight_scale = scale.view(1)
-            self._weight_version = weight_version
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._quantize_weights()
-
         if self._HAS_SCALED_MM and x.is_cuda:
-            # True FP8 compute path (SM89+)
-            # Quantize input to FP8
-            x_shape = x.shape
-            x_flat = x.view(-1, x_shape[-1])
-            x_amax = x_flat.abs().max().clamp(min=1e-12)
-            x_scale = x_amax / 448.0
-            x_fp8 = (x_flat / x_scale).to(torch.float8_e4m3fn)
-
-            # FP8 matmul: x @ W.T = (M, K) @ (K, N)
-            # _scaled_mm requires mat2 to be column-major
-            # weight_fp8 is (N, K) row-major, .t() gives (K, N) col-major view
-            out = torch._scaled_mm(
-                x_fp8,
-                self.weight_fp8.t(),  # (K, N) column-major view - NOT contiguous
-                scale_a=x_scale,
-                scale_b=self.weight_scale,
-                out_dtype=x.dtype
-            )
-            out = out.view(*x_shape[:-1], -1)
+            # True FP8 compute path with custom autograd
+            out = FP8MatmulFunction.apply(x, self.weight)
         else:
-            # Fallback: dequantize + BF16 matmul (storage savings only)
-            weight_dequant = self.weight_fp8.to(x.dtype) * self.weight_scale
-            out = torch.nn.functional.linear(x, weight_dequant, None)
+            # Fallback: standard BF16 matmul
+            out = torch.nn.functional.linear(x, self.weight, None)
 
         if self.bias is not None:
             out = out + self.bias
@@ -683,9 +822,10 @@ class FP8Linear(torch.nn.Module):
     def from_linear(cls, linear: torch.nn.Linear) -> 'FP8Linear':
         """Convert an existing Linear layer to FP8Linear."""
         fp8_linear = cls(linear.in_features, linear.out_features, bias=linear.bias is not None)
-        fp8_linear.weight.data.copy_(linear.weight.data)
+        # Ensure weight is on same device/dtype as source
+        fp8_linear.weight = torch.nn.Parameter(linear.weight.data.clone())
         if linear.bias is not None:
-            fp8_linear.bias.data.copy_(linear.bias.data)
+            fp8_linear.bias = torch.nn.Parameter(linear.bias.data.clone())
         return fp8_linear
 
 

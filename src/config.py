@@ -28,8 +28,8 @@ class ModelConfig:
 class TrainConfig:
     lr: float = 3e-4
     max_tokens: int = 1000000000  # 1B tokens for quick baseline
-    batch_size: int = 4
-    accumulation_steps: int = 8
+    batch_size: int = 2
+    accumulation_steps: int = 16  # Doubled to maintain effective batch size
     seq_len: int = 1024
     grad_clip: float = 1.0
     weight_decay: float = 0.1
@@ -44,7 +44,7 @@ class TrainConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     # FP8 training (requires SM89+ for compute benefits, otherwise storage-only)
-    use_fp8: bool = True
+    use_fp8: bool = True  # DeepSeek V3 style block-wise FP8
     @property
     def max_steps(self):
         return self.max_tokens // (self.batch_size * self.seq_len * self.accumulation_steps)
