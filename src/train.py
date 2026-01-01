@@ -277,7 +277,8 @@ if __name__ == "__main__":
                      model_config.local_window,
                      model_config.n_indexer_heads,
                      model_config.rms_eps,
-                     model_config.rope_base)
+                     model_config.rope_base,
+                     model_config.d_inner)
     if train_config.use_fp8:
         from kernels import convert_to_fp8
         model = convert_to_fp8(model)

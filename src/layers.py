@@ -30,6 +30,49 @@ class SwiGLU(nn.Module):
         # return calcualted SwiGLU
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
+class DeltaStream(nn.Module):
+    """
+    Delta Stream: geometric transformation on residual stream.
+
+    Based on Deep Delta Learning (DDL), applies the Delta Operator A(X)
+    to enable learnable forgetting/reflection before layer output is added.
+
+    Equation:
+      A(X) = I - β(X) · k(X) · k(X)^T     [Eq 2.4]
+
+    Usage in transformer: x = delta_stream(x) + layer(norm(x))
+
+    Spectral properties of A(X) controlled by β:
+      β → 0: Identity (A = I, no transformation)
+      β → 1: Projection (erase component along k)
+      β → 2: Reflection (flip sign along k)
+
+    Args:
+      d_model: hidden dimension
+      d_inner: inner dimension for k and β branches
+    """
+    def __init__(self, d_model: int, d_inner: int):
+        super().__init__()
+        self.k_branch = nn.Sequential(
+            nn.Linear(d_model, d_inner, bias=False),
+            nn.GELU(),
+            nn.Linear(d_inner, d_model, bias=False)
+        )
+        self.beta_branch = nn.Sequential(
+            nn.Linear(d_model, d_inner, bias=False),
+            nn.Tanh(),
+            nn.Linear(d_inner, 1, bias=False)
+        )
+
+    def forward(self, x):
+        pooled = x.mean(dim=1)
+        k = F.normalize(self.k_branch(pooled), dim=-1)
+        k_unsq = k.unsqueeze(1)
+        k_Tx = (k_unsq * x).sum(dim=-1, keepdim=True)
+        beta = 2 * torch.sigmoid(self.beta_branch(pooled))
+        beta_unsq = beta.unsqueeze(1)
+        Ax_x = x - beta_unsq * k_unsq * k_Tx
+        return Ax_x
 
 class GroupedExperts(nn.Module):
     """
@@ -162,10 +205,12 @@ class MoE(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base):
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base, d_inner):
         super().__init__()
 
         # init layers
+        self.delta_attn = DeltaStream(d_model, d_inner)
+        self.delta_ffn = DeltaStream(d_model, d_inner)
         self.rms1 = RMSNorm(d_model, eps=rms_eps)
         self.rms2 = RMSNorm(d_model, eps=rms_eps)
         self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len, k_ts, local_window, n_indexer_heads, rope_base)
@@ -176,10 +221,10 @@ class Transformer(nn.Module):
         normx = self.rms1(x)
 
         # pass norms to MHA and add to residual stream
-        x = x + self.attn(normx)
+        x = self.delta_attn(x) + self.attn(normx)
         
         # pass norms to SwiGLU and add to residual stream
-        x = x +  self.moe(self.rms2(x))
+        x = self.delta_ffn(x) + self.moe(self.rms2(x))
         return x
     
 class MultiTokenPrediction(nn.Module):
@@ -205,7 +250,8 @@ if __name__ == "__main__":
         cfg.d_model, cfg.hidden_dim, cfg.max_seq_len, cfg.n_heads,
         cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_rope, cfg.n_routed,
         cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
-        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base
+        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base,
+        cfg.d_inner
     )
     x = torch.randn(4, cfg.max_seq_len, cfg.d_model)
     print(f"Transformer output shape: {transformer(x).shape}")
@@ -215,3 +261,7 @@ if __name__ == "__main__":
     out = moe(x)
     print(f"MoE output shape: {out.shape}")
     print(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")
+    delta = DeltaStream(d_model=512, d_inner=128)
+    x = torch.randn(4, 128, 512)
+    out = delta(x)
+    print(f"DeltaStream: {x.shape} -> {out.shape}")

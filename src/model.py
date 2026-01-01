@@ -26,12 +26,13 @@ class Cinnamon(nn.Module):
                  local_window,
                  n_indexer_heads,
                  rms_eps,
-                 rope_base):
+                 rope_base,
+                 d_inner):
         super().__init__()
         self.n_layers = n_layers
 
         # init nn.Sequential using n_layers to create transformer blocks
-        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base) for _ in range(self.n_layers)])
+        self.transformer_layers = nn.Sequential(*[Transformer(d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base, d_inner) for _ in range(self.n_layers)])
 
         # init embedding, norm, and lm_heads
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -78,7 +79,8 @@ if __name__ == "__main__":
         cfg.d_model, cfg.n_layers, cfg.vocab_size, cfg.hidden_dim, cfg.n_heads,
         cfg.max_seq_len, cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_rope,
         cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
-        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base
+        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base,
+        cfg.d_inner
     )
     x = torch.randint(0, cfg.vocab_size, (4, cfg.max_seq_len))
     out, mtp_out = model(x)

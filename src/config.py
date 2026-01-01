@@ -20,6 +20,8 @@ class ModelConfig:
     k_ts: int = 64  # reduced from 256 - 64/1024 = 6.25% sparsity is more efficient
     local_window: int = 64  # reduced to match k_ts
     n_indexer_heads: int = 2  # DeepSeek V3.2 uses small head count for indexer
+    # Delta Stream (DDL)
+    d_inner: int = 128  # inner dim for DeltaStream k/β branches
     # Normalization and positional encoding
     rms_eps: float = 1e-6
     rope_base: float = 10000.0
