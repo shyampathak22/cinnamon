@@ -66,8 +66,8 @@ class MultiHeadAttention(nn.Module):
 
         # init RoPE class
         self.rope = RoPE(self.d_k, self.max_seq_len)
-    
-    def forward(self, query, key, value, attn_mask=None):
+
+    def forward(self, query, key, value):
         # calculate batch size by finding number of queries
         batch_size = query.size(0)
 
@@ -98,9 +98,32 @@ class LightningIndexer(nn.Module):
         scores = F.relu(torch.einsum('bthd,bsd->bths', q, k))
         I = torch.einsum('bths,h->bts', scores, self.w)
         return I
+    
+class TokenSelector(nn.Module):
+    def __init__(self, k, local_window):
+        super().__init__()
+        self.k = k
+        self.lw = local_window
+
+    def forward(self, I):
+        _, q_len, k_len = I.shape
+        device = I.device
+
+        q_pos = torch.arange(q_len, device=device).unsqueeze(1)
+        k_pos = torch.arange(k_len, device=device).unsqueeze(0)
+
+        local_mask = (k_pos >= q_pos - self.lw + 1) & (k_pos <= q_pos)
+        causal_mask = k_pos > q_pos
+
+        I.masked_fill_(local_mask, float('inf'))
+        I.masked_fill_(causal_mask, float('-inf'))
+
+        k = min(self.k, k_len, q_len)
+        _, indices = I.topk(k, dim=-1)
+        return indices
 
 class MultiheadLatentAttention(nn.Module):
-    def __init__(self, d_model, d_ckv, d_cq, n_head, d_head, d_rope, max_seq_len):
+    def __init__(self, d_model, d_ckv, d_cq, n_head, d_head, d_rope, max_seq_len, k_ts, local_window):
         super().__init__()
         self.n_head = n_head
         self.d_head = d_head
@@ -114,22 +137,41 @@ class MultiheadLatentAttention(nn.Module):
         self.w_kr = nn.Linear(d_model, d_rope, bias=False)
         self.pope = PoPE(d_rope, max_seq_len)
         self.w_out = nn.Linear(d_head*n_head, d_model, bias=False)
+        self.light_sel = LightningIndexer(d_model, n_head, d_head)
+        self.tok_sel = TokenSelector(k_ts, local_window)
+
+    def sparse_attention(self, query, key, value, scale):
+        scores = torch.einsum('bhld,bhlkd->bhlk', query, key) * scale
+        attn_weights = F.softmax(scores, dim=-1)
+        output = torch.einsum('bhlk,bhlkd->bhld', attn_weights, value)
+        return output
 
     def forward(self, x):
         batch_size = x.size(0)
-
         c_kv = self.w_dkv(x)
-        key_c = self.w_uk(c_kv).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
-        value = self.w_uv(c_kv).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
+        I = self.light_sel(x)
+        idx = self.tok_sel(I)
+        idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, c_kv.size(-1))
+        c_kv_expanded = c_kv.unsqueeze(1).expand(-1, idx.size(1), -1, -1)
+        ckv_selected = torch.gather(c_kv_expanded, dim=2, index=idx_expanded)
+        key_c = self.w_uk(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
+        value = self.w_uv(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
         c_q = self.w_dq(x)
         query_c = self.w_uq(c_q).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
 
         query_r = self.pope(self.w_qr(c_q).view(batch_size, -1, self.n_head, self.d_rope)).transpose(1, 2)
-        key_r = self.pope(self.w_kr(x).unsqueeze(2)).transpose(1, 2).expand(-1, self.n_head, -1, -1)
+        idx_expanded_x = idx.unsqueeze(-1).expand(-1, -1, -1, x.size(-1))
+        x_expanded = x.unsqueeze(1).expand(-1, idx.size(1), -1, -1)
+        x_selected = torch.gather(x_expanded, dim=2, index=idx_expanded_x)
+        ker_r_pre = self.w_kr(x_selected)
+        key_r = self.pope(ker_r_pre.permute(0, 2, 1, 3))
+        key_r = key_r.permute(0, 2, 1, 3)
+        key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1, -1)
         query = torch.concatenate((query_c, query_r), dim=-1)
         key = torch.concatenate((key_c, key_r), dim=-1)
 
-        attn_o = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=(self.d_head + self.d_rope)**-0.5).transpose(1, 2).reshape(batch_size, -1, self.d_head*self.n_head)
+        attn_o = self.sparse_attention(query, key, value, scale=(self.d_head + self.d_rope)**-0.5)
+        attn_o = attn_o.transpose(1, 2).reshape(batch_size, -1, self.d_head*self.n_head)
         return self.w_out(attn_o)
     
 if __name__ == "__main__":
@@ -142,10 +184,7 @@ if __name__ == "__main__":
     x = torch.randn(batch_size, max_seq_len, d_model)
     out= attn(x, x, x)
     print(f"output shape: {out.shape}")
-    mla = MultiheadLatentAttention(
-      d_model=512, d_ckv=256, d_cq=256,
-      n_head=8, d_head=64, d_rope=32, max_seq_len=1024
-    )
+    mla = MultiheadLatentAttention(d_model=512, d_ckv=256, d_cq=256,n_head=8, d_head=64, d_rope=32, max_seq_len=1024, k_ts=2048, local_window=128)
     x = torch.randn(4, 128, 512)
     out = mla(x)
     print(f"mla output shape: {out.shape}")
@@ -163,4 +202,10 @@ if __name__ == "__main__":
     indexer = LightningIndexer(d_model=512, n_head=8, d_head=64)
     h = torch.randn(4, 128, 512)
     relevance = indexer(h)
-    print(f"Relevance shape: {relevance.shape}")
+    print(f"relevance shape: {relevance.shape}")
+    selector = TokenSelector(k=32, local_window=8)
+    I = torch.randn(4, 64, 64)
+    indices = selector(I)
+    print(f"selected indices shape: {indices.shape}")
+    print(f"sample indices for query 0: {indices[0, 0, :10]}")
+    print(f"sample indices for query 63: {indices[0, 63, :10]}")
