@@ -853,6 +853,7 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
         'router',      # MoE gating must stay high precision
         'norm',        # RMSNorm
         'w_out',       # Attention output projection
+        'delta',       # DeltaStream - small layers, causes compile issues with FP8
     ]
 
     exclude_names = (exclude_names or []) + default_exclude

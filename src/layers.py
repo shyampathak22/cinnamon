@@ -64,6 +64,7 @@ class DeltaStream(nn.Module):
             nn.Linear(d_inner, 1, bias=False)
         )
 
+    @torch._dynamo.disable
     def forward(self, x):
         pooled = x.mean(dim=1)
         k = F.normalize(self.k_branch(pooled), dim=-1)
