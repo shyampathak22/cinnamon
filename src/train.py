@@ -7,7 +7,7 @@ import warnings
 # Silence spammy torch.compile warnings
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", message="Online softmax is disabled")
+logging.getLogger("torch._inductor.lowering").setLevel(logging.ERROR)
 from torch.utils.data import IterableDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP

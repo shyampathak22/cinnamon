@@ -21,9 +21,9 @@ class ModelConfig:
     local_window: int = 64  # reduced to match k_ts
     n_indexer_heads: int = 2  # DeepSeek V3.2 uses small head count for indexer
     # HyperDelta (mHC + DDL)
-    d_inner: int = 128  # inner dim for k/β branches
-    n_streams: int = 4  # number of parallel residual streams
-    sinkhorn_iters: int = 20  # iterations for doubly stochastic projection
+    d_inner: int = 128  # inner dim for k/β branches (consider 256 if underfitting)
+    n_streams: int = 4  # number of parallel residual streams (4-8 typical)
+    sinkhorn_iters: int = 10  # iterations for doubly stochastic projection (4x4 converges fast)
     # Normalization and positional encoding
     rms_eps: float = 1e-6
     rope_base: float = 10000.0

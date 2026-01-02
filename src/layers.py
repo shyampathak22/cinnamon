@@ -76,8 +76,8 @@ class HyperDelta(nn.Module):
         beta = torch.sigmoid(self.b_proj(cond))
         write = beta.unsqueeze(2) * torch.einsum('bsn,bsd->bsnd', k_s, v)
 
-        # Collect metrics (detached floats for torch.compile compatibility)
-        if self.training:
+        # Collect metrics (skip during torch.compile tracing)
+        if self.training and not torch.compiler.is_compiling():
             with torch.no_grad():
                 # Aggregation entropy (higher = more uniform stream usage)
                 agg_entropy = -(agg_w * agg_w.clamp(min=1e-8).log()).sum()
@@ -224,21 +224,23 @@ class MoE(nn.Module):
         # Update bias and collect metrics using already-computed expert_counts
         if self.training:
             self._update_bias(expert_counts, expanded_idx.numel())
-            with torch.no_grad():
-                # Load balance: coefficient of variation (std/mean), lower = better balance
-                counts_f = expert_counts.float()
-                load_balance_cv = counts_f.std() / counts_f.mean().clamp(min=1e-8)
-                # Router entropy: higher = more diverse routing
-                router_probs = scores.mean(dim=(0, 1))  # avg across batch and seq
-                router_entropy = -(router_probs * router_probs.clamp(min=1e-8).log()).sum()
-                # Expert utilization: fraction of experts receiving tokens
-                experts_used = (expert_counts > 0).float().mean()
-                self._metrics = {
-                    'load_balance_cv': load_balance_cv.item(),
-                    'router_entropy': router_entropy.item(),
-                    'experts_used': experts_used.item(),
-                    'expert_bias_std': self.expert_bias.std().item(),
-                }
+            # Skip metrics during torch.compile tracing
+            if not torch.compiler.is_compiling():
+                with torch.no_grad():
+                    # Load balance: coefficient of variation (std/mean), lower = better balance
+                    counts_f = expert_counts.float()
+                    load_balance_cv = counts_f.std() / counts_f.mean().clamp(min=1e-8)
+                    # Router entropy: higher = more diverse routing
+                    router_probs = scores.mean(dim=(0, 1))  # avg across batch and seq
+                    router_entropy = -(router_probs * router_probs.clamp(min=1e-8).log()).sum()
+                    # Expert utilization: fraction of experts receiving tokens
+                    experts_used = (expert_counts > 0).float().mean()
+                    self._metrics = {
+                        'load_balance_cv': load_balance_cv.item(),
+                        'router_entropy': router_entropy.item(),
+                        'experts_used': experts_used.item(),
+                        'expert_bias_std': self.expert_bias.std().item(),
+                    }
 
         return shared_out + routed_out
 
