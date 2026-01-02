@@ -52,13 +52,13 @@ class TrainConfig:
     peak_flops: float = 23.7e12
     mtp_lambda: float = 0.3
     mtp_lambda_final: float = 0.1
-    mtp_lambda_switch_tokens: int = 10_000_000_000_000  # 10T
+    mtp_lambda_switch_tokens: int = 33_800_000
     dsa_kl_weight: float = 1.0
     dsa_warmup_steps: int = 0
     dsa_warmup_lr: float = 1e-3
     moe_balance_alpha: float = 1e-2
     gamma_final: float = 0.0
-    gamma_switch_tokens: int = 14_300_000_000_000  # 14.3T
+    gamma_switch_tokens: int = 48_300_000
     # DataLoader settings
     num_workers: int = 4
     pin_memory: bool = True

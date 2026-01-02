@@ -235,28 +235,3 @@ class MTPModule(nn.Module):
         e = self.norm_emb(emb_next)
         h_proj = self.proj(torch.cat((h, e), dim=-1))
         return self.block(h_proj, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
-
-
-
-if __name__ == "__main__":
-    from config import ModelConfig
-    cfg = ModelConfig()
-
-    transformer = Transformer(
-        cfg.d_model, cfg.hidden_dim, cfg.max_seq_len, cfg.n_heads,
-        cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_v, cfg.d_rope, cfg.n_routed,
-        cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma, 0.0,
-        cfg.dsa_topk, cfg.local_window, cfg.n_indexer_heads, cfg.d_indexer_head,
-        cfg.rms_eps, cfg.rope_base, cfg.rope_type, cfg.pope_delta_init,
-        cfg.original_seq_len, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow,
-        cfg.mscale, cfg.indexer_use_fp8, cfg.indexer_use_hadamard
-    )
-    x = torch.randn(4, cfg.max_seq_len, cfg.d_model)
-    out, _, _ = transformer(x)
-    print(f"Transformer output shape: {out.shape}")
-
-    moe = MoE(cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.d_model, cfg.hidden_dim, cfg.expert_scale, cfg.gamma, 0.0)
-    x = torch.randn(4, 128, cfg.d_model)
-    out, _ = moe(x)
-    print(f"MoE output shape: {out.shape}")
-    print(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")

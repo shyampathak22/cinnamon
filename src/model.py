@@ -122,22 +122,3 @@ class Cinnamon(nn.Module):
         if compute_aux:
             return main_logits, mtp_logits, dsa_kl, moe_balance
         return main_logits, mtp_logits
-    
-if __name__ == "__main__":
-    from config import ModelConfig
-    cfg = ModelConfig()
-    cfg.n_layers = 4  # reduced for testing
-    model = Cinnamon(
-        cfg.d_model, cfg.n_layers, cfg.vocab_size, cfg.hidden_dim, cfg.n_heads,
-        cfg.max_seq_len, cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_v, cfg.d_rope,
-        cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
-        0.0, cfg.dsa_topk, cfg.local_window, cfg.n_indexer_heads, cfg.d_indexer_head,
-        cfg.rms_eps, cfg.rope_base, cfg.rope_type, cfg.mtp_depth, cfg.pope_delta_init,
-        cfg.original_seq_len, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow, cfg.mscale,
-        cfg.indexer_use_fp8, cfg.indexer_use_hadamard
-    )
-    x = torch.randint(0, cfg.vocab_size, (4, cfg.max_seq_len))
-    out, mtp_out = model(x)
-    mtp_shapes = [t.shape for t in mtp_out]
-    print(f"output shape: {out.shape}, mtp: {mtp_shapes}")
-    print(f"Total: {sum(p.numel() for p in model.parameters()):,} | Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")

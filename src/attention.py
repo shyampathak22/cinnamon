@@ -196,12 +196,14 @@ def hadamard_transform(x: torch.Tensor) -> torch.Tensor:
     if n & (n - 1) != 0:
         return x
     h = x
+    prefix = x.shape[:-1]
     step = 1
     while step < n:
-        h = h.view(*h.shape[:-1], -1, 2, step)
+        h = h.reshape(*prefix, -1, 2, step)
         a = h[..., 0, :]
         b = h[..., 1, :]
         h = torch.cat([a + b, a - b], dim=-1)
+        h = h.reshape(*prefix, n)
         step *= 2
     return h * (n ** -0.5)
 
@@ -460,119 +462,3 @@ class MultiheadLatentAttention(nn.Module):
             aux_loss = (p * (p.clamp_min(1e-9).log() - log_q)).sum(dim=-1).mean()
 
         return out, aux_loss
-    
-if __name__ == "__main__":
-    from config import ModelConfig
-    cfg = ModelConfig()
-
-    print("=" * 60)
-    print("Testing RoPE")
-    print("=" * 60)
-
-    # Test RoPE
-    rope = RoPE(cfg.d_rope, cfg.max_seq_len, cfg.rope_base)
-    x = torch.randn(4, 128, 8, cfg.d_rope)
-    out = rope(x)
-    print(f"RoPE input shape: {x.shape}, output shape: {out.shape}")
-
-    # Test RoPE with custom positions (for sparse attention)
-    positions = torch.randint(0, 128, (4, 128, 32))  # (batch, seq, k)
-    x_sparse = torch.randn(4, 128, 32, cfg.d_rope)
-    out_sparse = rope(x_sparse, positions=positions)
-    print(f"RoPE sparse input: {x_sparse.shape}, positions: {positions.shape}, output: {out_sparse.shape}")
-
-    print("\n" + "=" * 60)
-    print("Testing MLA with RoPE (default)")
-    print("=" * 60)
-
-    # Test MLA with RoPE
-    mla_rope = MultiheadLatentAttention(
-        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
-        cfg.d_rope, cfg.max_seq_len, cfg.dsa_topk, cfg.local_window,
-        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
-        cfg.rope_base, rope_type='rope', pope_delta_init=cfg.pope_delta_init,
-        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
-        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
-        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
-    )
-    x = torch.randn(4, 128, cfg.d_model)
-    out, _ = mla_rope(x)
-    print(f"MLA (RoPE) output shape: {out.shape}")
-
-    print("\n" + "=" * 60)
-    print("Testing MLA with PoPE")
-    print("=" * 60)
-
-    # Test MLA with PoPE
-    mla_pope = MultiheadLatentAttention(
-        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
-        cfg.d_rope, cfg.max_seq_len, cfg.dsa_topk, cfg.local_window,
-        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
-        cfg.rope_base, rope_type='pope', pope_delta_init=cfg.pope_delta_init,
-        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
-        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
-        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
-    )
-    out, _ = mla_pope(x)
-    print(f"MLA (PoPE) output shape: {out.shape}")
-
-    print("\n" + "=" * 60)
-    print("Testing PoPE extrapolation")
-    print("=" * 60)
-
-    # Test PoPE extrapolation
-    pope = PoPE(cfg.d_rope, cfg.max_seq_len, cfg.rope_base)
-    pope.cuda()
-    for seq_len in [1024, 4096, 16384]:
-        x = torch.randn(4, seq_len, 1, cfg.d_rope).cuda()
-        out = pope(x)
-        print(f"PoPE seq_len={seq_len}: {out.shape}")
-
-    print("\n" + "=" * 60)
-    print("Testing DSAIndexer")
-    print("=" * 60)
-
-    indexer = DSAIndexer(
-        cfg.d_model, cfg.d_cq, cfg.n_indexer_heads, cfg.d_indexer_head,
-        cfg.d_rope, cfg.max_seq_len, cfg.rope_base, cfg.rope_type,
-        cfg.dsa_topk, use_fp8=cfg.indexer_use_fp8, use_hadamard=cfg.indexer_use_hadamard,
-        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
-        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow
-    )
-    h = torch.randn(4, 128, cfg.d_model)
-    q_latent = torch.randn(4, 128, cfg.d_cq)
-    scores = indexer(h, q_latent, return_scores=True)
-    indices = indexer(h, q_latent, return_scores=False)
-    print(f"DSAIndexer scores shape: {scores.shape}, indices shape: {indices.shape}")
-
-    print("\n" + "=" * 60)
-    print("Benchmark MLA (RoPE) at different sequence lengths")
-    print("=" * 60)
-
-    import time
-    torch.cuda.empty_cache()
-    mla_sparse = MultiheadLatentAttention(
-        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
-        cfg.d_rope, 16384, cfg.dsa_topk, cfg.local_window,
-        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
-        cfg.rope_base, rope_type='rope', pope_delta_init=cfg.pope_delta_init,
-        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
-        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
-        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
-    )
-    mla_sparse.cuda()
-
-    for seq_len in [1024, 2048, 4096]:
-        torch.cuda.empty_cache()
-        x = torch.randn(1, seq_len, cfg.d_model).cuda()
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        out, _ = mla_sparse(x)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        print(f"seq_len={seq_len}: {elapsed*1000:.1f}ms, shape={out.shape}")
-        del x, out
-
-    print("\n" + "=" * 60)
-    print("All tests passed!")
-    print("=" * 60)

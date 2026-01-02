@@ -32,3 +32,18 @@ dev-dependencies = [
     "pytest",
     "ipython",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "cuda: marks tests as requiring CUDA (deselect with '-m \"not cuda\"')",
+    "slow: marks tests as slow running (deselect with '-m \"not slow\"')",
+    "benchmark: marks tests as benchmarks (select with '-m benchmark')",
+]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]

@@ -15,11 +15,3 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         # rsqrt = 1/sqrt, more efficient than sqrt + divide
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.gamma
-    
-if __name__ == "__main__":
-    from config import ModelConfig
-    cfg = ModelConfig()
-    rms = RMSNorm(cfg.d_model, cfg.rms_eps)
-    x = torch.randn((32, cfg.max_seq_len, cfg.d_model))
-    norm = rms(x)
-    print(f"RMSNorm output shape: {norm.shape}")
