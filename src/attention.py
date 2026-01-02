@@ -6,30 +6,64 @@ import warnings
 
 class PoPE(nn.Module):
     """
-    Probabilistic Positional Encoding with learnable phase offset.
-    Caches base angles for efficiency - only delta is applied at runtime.
+    Polar Positional Encoding (PoPE) with learnable phase offset.
+
+    Uses d/2 frequencies to preserve dot-product compatibility:
+    - Query at pos t: [μ·cos(tθ), μ·sin(tθ)]
+    - Key at pos s:   [μ·cos(sθ + δ), μ·sin(sθ + δ)]
+    - q·k = Σ μ_q·μ_k·cos((s-t)θ + δ)
     """
     def __init__(self, d_k, max_seq_len, base):
         super().__init__()
-        self.register_buffer('theta', 1 / (base**(2*(torch.arange(0, d_k//2)) / d_k)))
+        self.d_k = d_k
+        self.n_freq = d_k // 2
+        self.base = base
+        self.register_buffer('theta', base ** (-(torch.arange(self.n_freq, dtype=torch.float32) / self.n_freq)))
 
-        # Cache base angles (without delta) - shape: (max_seq_len, d_k//2)
-        pos = torch.arange(max_seq_len)
+        # Cache base angles (without delta) - shape: (max_seq_len, n_freq)
+        pos = torch.arange(max_seq_len, dtype=torch.float32)
         self.register_buffer('base_angles', torch.outer(pos, self.theta))
 
-        # Learnable phase offset
-        self.raw_delta = nn.Parameter(torch.zeros(d_k // 2))
+        # Learnable phase offset δ ∈ [-2π, 0]
+        self.raw_delta = nn.Parameter(torch.zeros(self.n_freq))
 
-    def forward(self, x):
-        # Apply learnable delta to cached base angles
-        delta = -2 * torch.pi * torch.sigmoid(self.raw_delta)
-        angles = self.base_angles[:x.size(1)].unsqueeze(0).unsqueeze(2) + delta
-        cos = angles.cos()
-        sin = angles.sin()
-        mu1, mu2 = torch.chunk(F.softplus(x), 2, dim=-1)
-        x1 = mu1 * cos - mu2 * sin
-        x2 = mu1 * sin + mu2 * cos
-        return torch.cat((x1, x2), dim=-1)
+    def _extend_base_angles(self, seq_len):
+        """Extend cache for longer sequences."""
+        if seq_len <= self.base_angles.size(0):
+            return self.base_angles[:seq_len]
+        pos = torch.arange(seq_len, device=self.theta.device, dtype=self.theta.dtype)
+        return torch.outer(pos, self.theta)
+
+    def forward(self, x, apply_delta=True, positions=None):
+        """
+        Args:
+            x: (batch, seq, heads, d_k) or (batch, seq, k, d_k)
+            apply_delta: if True, add learnable phase offset (use for keys only)
+            positions: optional positions tensor with shape (seq,), (batch, seq), or (batch, seq, k)
+        """
+        seq_len = x.size(1)
+
+        if positions is None:
+            phases = self._extend_base_angles(seq_len).unsqueeze(0).unsqueeze(2)
+        else:
+            pos = positions
+            if pos.dim() == 1:
+                pos = pos.unsqueeze(0)
+            if pos.dim() == 2:
+                pos = pos.unsqueeze(-1)
+            pos = pos.to(device=self.theta.device, dtype=self.theta.dtype)
+            phases = pos[..., None] * self.theta
+
+        if apply_delta:
+            delta = -2 * torch.pi * torch.sigmoid(self.raw_delta)
+            phases = phases + delta
+
+        # Single magnitude per frequency (shared across cos/sin)
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        mu = F.softplus(x1 + x2)
+        cos_out = mu * phases.cos()
+        sin_out = mu * phases.sin()
+        return torch.cat((cos_out, sin_out), dim=-1)
 
 
 class LightningIndexer(nn.Module):
@@ -153,10 +187,12 @@ class MultiheadLatentAttention(nn.Module):
         c_q = self.w_dq(x)
         query_c = self.w_uq(c_q).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
 
-        query_r = self.pope(self.w_qr(c_q).view(batch_size, -1, self.n_head, self.d_rope)).transpose(1, 2)
+        query_r = self.pope(
+            self.w_qr(c_q).view(batch_size, -1, self.n_head, self.d_rope),
+            apply_delta=False
+        ).transpose(1, 2)
         ker_r_pre = self.w_kr(x_selected)
-        key_r = self.pope(ker_r_pre.permute(0, 2, 1, 3))
-        key_r = key_r.permute(0, 2, 1, 3)
+        key_r = self.pope(ker_r_pre, apply_delta=True, positions=idx)
         key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1, -1)
         query = torch.cat((query_c, query_r), dim=-1)
         key = torch.cat((key_c, key_r), dim=-1)
