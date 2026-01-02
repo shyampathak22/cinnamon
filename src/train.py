@@ -2,10 +2,12 @@ import torch
 import torch.nn
 import torch.nn.functional as F
 import logging
+import warnings
 
 # Silence spammy torch.compile warnings
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message="Online softmax is disabled")
 from torch.utils.data import IterableDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -214,14 +216,20 @@ class Trainer():
                         ema_tok_per_sec = 0.9 * ema_tok_per_sec + (0.1) * tok_per_sec
                     if self.rank == 0:
                         pbar.set_postfix_str(f"loss: {loss.item():.4f} | ema loss: {ema_loss:.4f} | tok/s: {ema_tok_per_sec:.2f} | mfu: {ema_mfu * 100:.2f}% | tokens_seen: {self.tokens_seen/1e9:.2f}B")
-                        wandb.log({"train/loss": loss.item(),
+                        log_dict = {"train/loss": loss.item(),
                                 "train/ema_loss": ema_loss,
                                 "model/lr": self.scheduler.get_last_lr()[0],
                                 "train/step": self.step,
                                 "train/tokens_seen": self.tokens_seen,
                                 "train/mtp_loss": mtp_loss.item(),
                                 "train/main_loss": main_loss.item()
-                                })
+                                }
+                        # Collect module metrics every 50 steps to avoid overhead
+                        if self.step % 50 == 0:
+                            unwrapped = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+                            unwrapped = unwrapped.module if hasattr(unwrapped, 'module') else unwrapped
+                            log_dict.update(unwrapped.collect_metrics())
+                        wandb.log(log_dict)
                     if self.step % self.config.eval_steps == 0 and self.step > 0:
                         self.model.eval()
                         eval_loss, eval_main_loss, eval_mtp_loss = self.val()
@@ -278,7 +286,9 @@ if __name__ == "__main__":
                      model_config.n_indexer_heads,
                      model_config.rms_eps,
                      model_config.rope_base,
-                     model_config.d_inner)
+                     model_config.d_inner,
+                     model_config.n_streams,
+                     model_config.sinkhorn_iters)
     if train_config.use_fp8:
         from kernels import convert_to_fp8
         model = convert_to_fp8(model)

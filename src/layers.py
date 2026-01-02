@@ -30,50 +30,71 @@ class SwiGLU(nn.Module):
         # return calcualted SwiGLU
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
-class DeltaStream(nn.Module):
-    """
-    Delta Stream: geometric transformation on residual stream.
+class HyperDelta(nn.Module):
 
-    Based on Deep Delta Learning (DDL), applies the Delta Operator A(X)
-    to enable learnable forgetting/reflection before layer output is added.
-
-    Equation:
-      A(X) = I - β(X) · k(X) · k(X)^T     [Eq 2.4]
-
-    Usage in transformer: x = delta_stream(x) + layer(norm(x))
-
-    Spectral properties of A(X) controlled by β:
-      β → 0: Identity (A = I, no transformation)
-      β → 1: Projection (erase component along k)
-      β → 2: Reflection (flip sign along k)
-
-    Args:
-      d_model: hidden dimension
-      d_inner: inner dimension for k and β branches
-    """
-    def __init__(self, d_model: int, d_inner: int):
+    def __init__(self, d_model, n_streams, sinkhorn_iters, d_inner):
         super().__init__()
-        self.k_branch = nn.Sequential(
+        self.p_logits = nn.Parameter(torch.eye(n_streams, n_streams))
+        self.agg_logits = nn.Parameter(torch.zeros(n_streams))
+        self.k_f_proj = nn.Sequential(
             nn.Linear(d_model, d_inner, bias=False),
             nn.GELU(),
             nn.Linear(d_inner, d_model, bias=False)
         )
-        self.beta_branch = nn.Sequential(
+        self.beta_f_proj = nn.Sequential(
             nn.Linear(d_model, d_inner, bias=False),
             nn.Tanh(),
             nn.Linear(d_inner, 1, bias=False)
         )
+        self.k_s_proj = nn.Linear(d_model, n_streams, bias=False)
+        self.b_proj = nn.Linear(d_model, 1, bias=False)
+        self.sinkhorn_iters = sinkhorn_iters
+        # Metrics storage (populated during forward, read by trainer)
+        self._metrics = {}
 
-    @torch._dynamo.disable
-    def forward(self, x):
-        pooled = x.mean(dim=1)
-        k = F.normalize(self.k_branch(pooled), dim=-1)
-        k_unsq = k.unsqueeze(1)
-        k_Tx = (k_unsq * x).sum(dim=-1, keepdim=True)
-        beta = 2 * torch.sigmoid(self.beta_branch(pooled))
-        beta_unsq = beta.unsqueeze(1)
-        Ax_x = x - beta_unsq * k_unsq * k_Tx
-        return Ax_x
+    def sinkhorn(self, logits):
+        M = logits.exp()
+        for _ in range(self.sinkhorn_iters):
+            M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        return M
+    
+    def forward(self, x, layer_fn):
+        # x: [B, S, N, D]
+
+        cond = x.mean(dim=2)
+        agg_w = F.softmax(self.agg_logits, dim=0)
+        layer_input = torch.einsum('bsnd,n->bsd', x, agg_w)
+        v = layer_fn(layer_input)
+        k_f = F.normalize(self.k_f_proj(cond), dim=-1)
+        beta_f = 2 * torch.sigmoid(self.beta_f_proj(cond))
+        x_proj = torch.einsum('bsnd,bsd->bsn', x, k_f)
+        x_erased = x - beta_f.unsqueeze(2) * torch.einsum('bsn,bsd->bsnd', x_proj, k_f)
+        p = self.sinkhorn(self.p_logits)
+        x_mixed = torch.einsum('nm,bsmd->bsnd', p, x_erased)
+        k_s = F.softmax(self.k_s_proj(cond), dim=-1)
+        beta = torch.sigmoid(self.b_proj(cond))
+        write = beta.unsqueeze(2) * torch.einsum('bsn,bsd->bsnd', k_s, v)
+
+        # Collect metrics (detached floats for torch.compile compatibility)
+        if self.training:
+            with torch.no_grad():
+                # Aggregation entropy (higher = more uniform stream usage)
+                agg_entropy = -(agg_w * agg_w.clamp(min=1e-8).log()).sum()
+                # P matrix entropy (higher = more mixing between streams)
+                p_entropy = -(p * p.clamp(min=1e-8).log()).sum() / p.size(0)
+                # Stream selection entropy for writes
+                k_s_entropy = -(k_s * k_s.clamp(min=1e-8).log()).sum(dim=-1).mean()
+                self._metrics = {
+                    'agg_entropy': agg_entropy.item(),
+                    'p_entropy': p_entropy.item(),
+                    'beta_f_mean': beta_f.mean().item(),
+                    'beta_write_mean': beta.mean().item(),
+                    'k_s_entropy': k_s_entropy.item(),
+                }
+
+        return x_mixed + write
+
 
 class GroupedExperts(nn.Module):
     """
@@ -149,6 +170,8 @@ class MoE(nn.Module):
         self.d_model = d_model
         self.gamma = gamma
         self.register_buffer("expert_bias", torch.zeros(n_routed))
+        # Metrics storage (populated during forward, read by trainer)
+        self._metrics = {}
 
     def _update_bias(self, expert_counts: torch.Tensor, total_selections: int):
         """Update expert bias using precomputed counts (avoids duplicate bincount)."""
@@ -198,34 +221,47 @@ class MoE(nn.Module):
         expanded_out = expanded_out.view(n_tokens, self.top_k, d)
         routed_out = expanded_out.sum(dim=1).view(batch, seq, d)
 
-        # Update bias using already-computed expert_counts
+        # Update bias and collect metrics using already-computed expert_counts
         if self.training:
             self._update_bias(expert_counts, expanded_idx.numel())
+            with torch.no_grad():
+                # Load balance: coefficient of variation (std/mean), lower = better balance
+                counts_f = expert_counts.float()
+                load_balance_cv = counts_f.std() / counts_f.mean().clamp(min=1e-8)
+                # Router entropy: higher = more diverse routing
+                router_probs = scores.mean(dim=(0, 1))  # avg across batch and seq
+                router_entropy = -(router_probs * router_probs.clamp(min=1e-8).log()).sum()
+                # Expert utilization: fraction of experts receiving tokens
+                experts_used = (expert_counts > 0).float().mean()
+                self._metrics = {
+                    'load_balance_cv': load_balance_cv.item(),
+                    'router_entropy': router_entropy.item(),
+                    'experts_used': experts_used.item(),
+                    'expert_bias_std': self.expert_bias.std().item(),
+                }
 
         return shared_out + routed_out
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base, d_inner):
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base, d_inner, n_streams, sinkhorn_iters):
         super().__init__()
 
         # init layers
-        self.delta_attn = DeltaStream(d_model, d_inner)
-        self.delta_ffn = DeltaStream(d_model, d_inner)
+        self.hyper_delta_attn = HyperDelta(d_model, n_streams, sinkhorn_iters, d_inner)
+        self.hyper_delta_ffn = HyperDelta(d_model, n_streams, sinkhorn_iters, d_inner)
         self.rms1 = RMSNorm(d_model, eps=rms_eps)
         self.rms2 = RMSNorm(d_model, eps=rms_eps)
         self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len, k_ts, local_window, n_indexer_heads, rope_base)
         self.moe = MoE(n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma)
 
     def forward(self, x):
-        # compute norm of input
-        normx = self.rms1(x)
 
-        # pass norms to MHA and add to residual stream
-        x = self.delta_attn(x) + self.attn(normx)
+        # pass norms to MHA and add to delta-residual stream
+        x = self.hyper_delta_attn(x, lambda inp: self.attn(self.rms1(inp)))
         
-        # pass norms to SwiGLU and add to residual stream
-        x = self.delta_ffn(x) + self.moe(self.rms2(x))
+        # pass norms to SwiGLU and add to delta-residual stream
+        x = self.hyper_delta_ffn(x, lambda inp: self.moe(self.rms2(inp)))
         return x
     
 class MultiTokenPrediction(nn.Module):
@@ -252,9 +288,9 @@ if __name__ == "__main__":
         cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_rope, cfg.n_routed,
         cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
         cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base,
-        cfg.d_inner
+        cfg.d_inner, cfg.n_streams, cfg.sinkhorn_iters
     )
-    x = torch.randn(4, cfg.max_seq_len, cfg.d_model)
+    x = torch.randn(4, cfg.max_seq_len, cfg.n_streams, cfg.d_model)
     print(f"Transformer output shape: {transformer(x).shape}")
 
     moe = MoE(cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.d_model, cfg.hidden_dim, cfg.expert_scale, cfg.gamma)
@@ -262,7 +298,3 @@ if __name__ == "__main__":
     out = moe(x)
     print(f"MoE output shape: {out.shape}")
     print(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")
-    delta = DeltaStream(d_model=512, d_inner=128)
-    x = torch.randn(4, 128, 512)
-    out = delta(x)
-    print(f"DeltaStream: {x.shape} -> {out.shape}")
