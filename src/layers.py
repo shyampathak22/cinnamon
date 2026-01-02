@@ -92,7 +92,7 @@ class MoE(nn.Module):
     Uses GroupedExperts for routed experts (all experts in one kernel launch)
     and standard SwiGLU for shared experts.
     """
-    def __init__(self, n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma):
+    def __init__(self, n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma, balance_alpha=0.0):
         super().__init__()
         routed_hidden = hidden_dim // expert_scale
 
@@ -104,12 +104,14 @@ class MoE(nn.Module):
         self.n_routed = n_routed
         self.d_model = d_model
         self.gamma = gamma
+        self.balance_alpha = balance_alpha
         self.register_buffer("expert_bias", torch.zeros(n_routed))
 
     def _update_bias(self, expert_counts: torch.Tensor, total_selections: int):
         """Update expert bias using precomputed counts (avoids duplicate bincount)."""
         expected = total_selections / self.n_routed
-        self.expert_bias += self.gamma * (expected - expert_counts.float()) / expected
+        delta = torch.where(expert_counts.float() > expected, -self.gamma, self.gamma)
+        self.expert_bias += delta
         self.expert_bias.clamp_(-1, 1)
 
     def forward(self, x):
@@ -120,6 +122,7 @@ class MoE(nn.Module):
         selection_scores = scores + self.expert_bias
         _, top_idx = selection_scores.topk(self.top_k, dim=-1)
         top_scores = scores.gather(-1, top_idx)
+        top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-9)
 
         # Efficient MoE: permute-process-unpermute with grouped GEMM
         flat_x = x.view(-1, d)
@@ -158,42 +161,80 @@ class MoE(nn.Module):
         if self.training:
             self._update_bias(expert_counts, expanded_idx.numel())
 
-        return shared_out + routed_out
+        balance_loss = None
+        if self.balance_alpha > 0:
+            # Sequence-wise balance loss to avoid per-sequence collapse
+            flat_top_idx = top_idx.view(batch, -1)
+            counts = torch.zeros(batch, self.n_routed, device=x.device, dtype=x.dtype)
+            counts.scatter_add_(1, flat_top_idx, torch.ones_like(flat_top_idx, dtype=x.dtype))
+            f_i = counts * (self.n_routed / (self.top_k * seq))
+
+            s_norm = scores / (scores.sum(dim=-1, keepdim=True) + 1e-9)
+            p_i = s_norm.mean(dim=1)
+
+            balance_loss = self.balance_alpha * (f_i * p_i).sum(dim=-1).mean()
+
+        return shared_out + routed_out, balance_loss
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_rope, n_routed, n_shared, top_k, expert_scale, gamma, k_ts, local_window, n_indexer_heads, rms_eps, rope_base):
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_v, d_rope,
+                 n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
+                 n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type='rope',
+                 pope_delta_init='zero', original_seq_len=None, rope_factor=1.0, beta_fast=32,
+                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True):
         super().__init__()
 
         # init layers
         self.rms1 = RMSNorm(d_model, eps=rms_eps)
         self.rms2 = RMSNorm(d_model, eps=rms_eps)
-        self.attn = MultiheadLatentAttention(d_model, d_ckv, d_cq, n_heads, d_head, d_rope, max_seq_len, k_ts, local_window, n_indexer_heads, rope_base)
-        self.moe = MoE(n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma)
+        self.attn = MultiheadLatentAttention(
+            d_model, d_ckv, d_cq, n_heads, d_head, d_v, d_rope, max_seq_len,
+            dsa_topk, local_window, n_indexer_heads, d_indexer_head, rms_eps,
+            rope_base, rope_type, pope_delta_init, original_seq_len, rope_factor, beta_fast,
+            beta_slow, mscale, indexer_use_fp8, indexer_use_hadamard
+        )
+        self.moe = MoE(n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma, balance_alpha)
 
-    def forward(self, x):
+    def forward(self, x, dsa_warmup=False, compute_aux=False):
         # compute norm of input
         normx = self.rms1(x)
 
         # pass norms to MHA and add to residual stream
-        x = x + self.attn(normx)
+        attn_out, attn_aux = self.attn(normx, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+        x = x + attn_out
         
         # pass norms to SwiGLU and add to residual stream
-        x = x +  self.moe(self.rms2(x))
-        return x
+        moe_out, moe_aux = self.moe(self.rms2(x))
+        x = x + moe_out
+        return x, attn_aux, moe_aux
     
-class MultiTokenPrediction(nn.Module):
-
-    def __init__(self, d_model, rms_eps):
+class MTPModule(nn.Module):
+    """
+    DeepSeek-V3 style Multi-Token Prediction module.
+    """
+    def __init__(self, d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_v, d_rope,
+                 n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
+                 n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type='rope',
+                 pope_delta_init='zero', original_seq_len=None, rope_factor=1.0, beta_fast=32,
+                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True):
         super().__init__()
-        self.normh = RMSNorm(d_model, eps=rms_eps)
-        self.normemb = RMSNorm(d_model, eps=rms_eps)
-        self.proj = nn.Linear(2*d_model, d_model, bias=False)
+        self.norm_h = RMSNorm(d_model, eps=rms_eps)
+        self.norm_emb = RMSNorm(d_model, eps=rms_eps)
+        self.proj = nn.Linear(2 * d_model, d_model, bias=False)
+        self.block = Transformer(
+            d_model, hidden_dim, max_seq_len, n_heads, d_ckv, d_cq, d_head, d_v, d_rope,
+            n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
+            n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type, pope_delta_init,
+            original_seq_len, rope_factor, beta_fast, beta_slow, mscale,
+            indexer_use_fp8, indexer_use_hadamard
+        )
 
-    def forward(self, x, target_emb):
-        x = self.normh(x)
-        y = self.normemb(target_emb)
-        return self.proj(torch.cat((x, y), dim=-1))
+    def forward(self, h_prev, emb_next, dsa_warmup=False, compute_aux=False):
+        h = self.norm_h(h_prev)
+        e = self.norm_emb(emb_next)
+        h_proj = self.proj(torch.cat((h, e), dim=-1))
+        return self.block(h_proj, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
 
 
 
@@ -203,15 +244,19 @@ if __name__ == "__main__":
 
     transformer = Transformer(
         cfg.d_model, cfg.hidden_dim, cfg.max_seq_len, cfg.n_heads,
-        cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_rope, cfg.n_routed,
-        cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma,
-        cfg.k_ts, cfg.local_window, cfg.n_indexer_heads, cfg.rms_eps, cfg.rope_base
+        cfg.d_ckv, cfg.d_cq, cfg.d_head, cfg.d_v, cfg.d_rope, cfg.n_routed,
+        cfg.n_shared, cfg.top_k, cfg.expert_scale, cfg.gamma, 0.0,
+        cfg.dsa_topk, cfg.local_window, cfg.n_indexer_heads, cfg.d_indexer_head,
+        cfg.rms_eps, cfg.rope_base, cfg.rope_type, cfg.pope_delta_init,
+        cfg.original_seq_len, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow,
+        cfg.mscale, cfg.indexer_use_fp8, cfg.indexer_use_hadamard
     )
     x = torch.randn(4, cfg.max_seq_len, cfg.d_model)
-    print(f"Transformer output shape: {transformer(x).shape}")
+    out, _, _ = transformer(x)
+    print(f"Transformer output shape: {out.shape}")
 
-    moe = MoE(cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.d_model, cfg.hidden_dim, cfg.expert_scale, cfg.gamma)
+    moe = MoE(cfg.n_routed, cfg.n_shared, cfg.top_k, cfg.d_model, cfg.hidden_dim, cfg.expert_scale, cfg.gamma, 0.0)
     x = torch.randn(4, 128, cfg.d_model)
-    out = moe(x)
+    out, _ = moe(x)
     print(f"MoE output shape: {out.shape}")
     print(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")

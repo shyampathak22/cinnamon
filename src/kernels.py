@@ -25,6 +25,7 @@ def quantize_fp8_rowwise_kernel(
     stride_xm, stride_xn,
     stride_fp8m, stride_fp8n,
     BLOCK_SIZE: tl.constexpr,  # 128 for DeepSeek-style
+    ROUND_SCALE: tl.constexpr,
     FP8_MAX: tl.constexpr = 448.0,
 ):
     """
@@ -49,8 +50,11 @@ def quantize_fp8_rowwise_kernel(
     # Online scaling: max(|x|) / 448
     abs_max = tl.max(tl.abs(x))
     # Avoid division by zero and underflow - minimum scale prevents x/scale overflow
-    abs_max = tl.maximum(abs_max, 1e-12)
-    scale = abs_max / FP8_MAX
+    abs_max = tl.maximum(abs_max, 1e-4)
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(abs_max / FP8_MAX)))
+    else:
+        scale = abs_max / FP8_MAX
 
     # Quantize with clamping to prevent overflow
     x_scaled = x / scale
@@ -77,6 +81,7 @@ def quantize_fp8_blockwise_kernel(
     stride_fp8m, stride_fp8n,
     BLOCK_M: tl.constexpr,  # 128
     BLOCK_N: tl.constexpr,  # 128
+    ROUND_SCALE: tl.constexpr,
     FP8_MAX: tl.constexpr = 448.0,
 ):
     """
@@ -106,8 +111,11 @@ def quantize_fp8_blockwise_kernel(
     # Online scaling: max(|x|) / 448 over entire block
     abs_max = tl.max(tl.abs(x))
     # Avoid division by zero and underflow - minimum scale prevents x/scale overflow
-    abs_max = tl.maximum(abs_max, 1e-12)
-    scale = abs_max / FP8_MAX
+    abs_max = tl.maximum(abs_max, 1e-4)
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(abs_max / FP8_MAX)))
+    else:
+        scale = abs_max / FP8_MAX
 
     # Quantize with clamping to prevent overflow
     x_scaled = x / scale
@@ -167,7 +175,11 @@ def dequantize_fp8_kernel(
 
 # Python wrappers
 
-def quantize_fp8_rowwise(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_rowwise(
+    x: torch.Tensor,
+    block_size: int = 128,
+    round_scale: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize activations with row-wise (1 x block_size) scaling.
 
@@ -197,12 +209,18 @@ def quantize_fp8_rowwise(x: torch.Tensor, block_size: int = 128) -> tuple[torch.
         x.stride(0), x.stride(1),
         x_fp8.stride(0), x_fp8.stride(1),
         BLOCK_SIZE=block_size,
+        ROUND_SCALE=round_scale,
     )
 
     return x_fp8, scales
 
 
-def quantize_fp8_blockwise(x: torch.Tensor, block_m: int = 128, block_n: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_blockwise(
+    x: torch.Tensor,
+    block_m: int = 128,
+    block_n: int = 128,
+    round_scale: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize weights with block-wise (block_m x block_n) scaling.
 
@@ -233,9 +251,32 @@ def quantize_fp8_blockwise(x: torch.Tensor, block_m: int = 128, block_n: int = 1
         x_fp8.stride(0), x_fp8.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        ROUND_SCALE=round_scale,
     )
 
     return x_fp8, scales
+
+
+def dequantize_fp8_rowwise(x_fp8: torch.Tensor, scales: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantize FP8 tensor quantized with row-wise (1 x block_size) scaling.
+
+    Args:
+        x_fp8: FP8 tensor of shape (M, N)
+        scales: Scale factors of shape (M, ceil(N / block_size))
+        block_size: Block size used during quantization
+    """
+    M, N = x_fp8.shape
+    num_blocks = scales.shape[1]
+    pad = num_blocks * block_size - N
+    if pad > 0:
+        x_fp8 = torch.nn.functional.pad(x_fp8, (0, pad))
+    x_fp8 = x_fp8.view(M, num_blocks, block_size).float()
+    scales = scales.view(M, num_blocks, 1)
+    x = (x_fp8 * scales).view(M, num_blocks * block_size)
+    if pad > 0:
+        x = x[:, :N]
+    return x
 
 
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor, block_m: int = 128, block_n: int = 128) -> torch.Tensor:
@@ -279,11 +320,12 @@ def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor, block_m: int = 128
 def lightning_indexer_kernel(
     Q_ptr,          # Query tensor: (batch, seq_q, n_head, d_head)
     K_ptr,          # Key tensor: (batch, seq_k, d_head)
-    W_ptr,          # Head weights: (n_head,)
+    W_ptr,          # Head weights: (batch, seq_q, n_head)
     Out_ptr,        # Output logits: (batch, seq_q, seq_k)
     batch_size, seq_q, seq_k, d_head,
     stride_qb, stride_qq, stride_qh, stride_qd,
     stride_kb, stride_kk, stride_kd,
+    stride_wb, stride_wq, stride_wh,
     stride_ob, stride_oq, stride_ok,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -291,7 +333,7 @@ def lightning_indexer_kernel(
     N_HEAD: tl.constexpr,  # Compile-time head count for unrolling
 ):
     """
-    Fused Lightning Indexer: computes I[b,q,k] = sum_h(ReLU(Q[b,q,h,:] · K[b,k,:]) * W[h])
+    Fused Lightning Indexer: computes I[b,q,k] = sum_h(ReLU(Q[b,q,h,:] · K[b,k,:]) * W[b,q,h])
 
     Optimizations:
     - N_HEAD as constexpr enables compile-time loop unrolling
@@ -319,8 +361,9 @@ def lightning_indexer_kernel(
     for h in range(N_HEAD):
         dot = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
 
-        # Load weight for this head
-        w_h = tl.load(W_ptr + h)
+        # Load weight for this head and query block
+        w_ptrs = W_ptr + pid_b * stride_wb + q_offs[:, None] * stride_wq + h * stride_wh
+        w_h = tl.load(w_ptrs, mask=q_mask[:, None], other=0.0)
 
         for d_start in range(0, d_head, BLOCK_D):
             d_idx = d_start + d_offs
@@ -347,7 +390,7 @@ def lightning_indexer_kernel(
 def lightning_indexer_fused(
     q: torch.Tensor,  # (batch, seq_q, n_head, d_head)
     k: torch.Tensor,  # (batch, seq_k, d_head)
-    w: torch.Tensor,  # (n_head,)
+    w: torch.Tensor,  # (batch, seq_q, n_head)
 ) -> torch.Tensor:
     """
     Fused Lightning Indexer kernel.
@@ -355,7 +398,7 @@ def lightning_indexer_fused(
     Args:
         q: Query tensor of shape (batch, seq_q, n_head, d_head)
         k: Key tensor of shape (batch, seq_k, d_head)
-        w: Head weights of shape (n_head,)
+    w: Head weights of shape (batch, seq_q, n_head)
 
     Returns:
         Logits tensor of shape (batch, seq_q, seq_k) in FP16
@@ -377,6 +420,7 @@ def lightning_indexer_fused(
         batch, seq_q, seq_k, d_head,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2),
+        w.stride(0), w.stride(1), w.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         BLOCK_Q=BLOCK_Q,
         BLOCK_K=BLOCK_K,
@@ -680,122 +724,83 @@ def _unpad(x: torch.Tensor, orig_shape: tuple[int, int]) -> torch.Tensor:
 
 class FP8MatmulFunction(torch.autograd.Function):
     """
-    FP8 matmul using torch._scaled_mm for hardware acceleration.
+    DeepSeek-V3 style FP8 matmul with fine-grained scaling.
 
-    Uses cuBLAS FP8 tensor cores for ~15x speedup over BF16.
-    Per-tensor scaling for simplicity and _scaled_mm compatibility.
+    - Activations: row-wise 1x128 scaling
+    - Weights: block-wise 128x128 scaling
     """
 
     @staticmethod
-    def forward(ctx, x, weight):
-        """Forward: y = x @ W.T using hardware FP8."""
+    def forward(ctx, x, weight, round_scale):
         x_shape = x.shape
         x_flat = x.reshape(-1, x_shape[-1]).contiguous()  # (M, K)
         M, K = x_flat.shape
         N = weight.shape[0]  # weight is (N, K)
 
-        # Pad to multiples of 16 for _scaled_mm
-        x_padded, x_orig = _pad_to_multiple(x_flat)
-        w_padded, w_orig = _pad_to_multiple(weight)
+        x_fp8, x_scale = quantize_fp8_rowwise(x_flat, block_size=128, round_scale=round_scale)
+        w_fp8, w_scale = quantize_fp8_blockwise(weight.float(), block_m=128, block_n=128)
+        w_fp8_t = w_fp8.t().contiguous()
+        w_scale_t = w_scale.t().contiguous()
 
-        # Quantize to FP8 with per-tensor scaling
-        x_fp8, x_scale = _fp8_quantize_tensor(x_padded)
-        w_fp8, w_scale = _fp8_quantize_tensor(w_padded)
+        if x.is_cuda:
+            out = fp8_matmul_dsv3(x_fp8, w_fp8_t, x_scale, w_scale_t)
+        else:
+            x_deq = dequantize_fp8_rowwise(x_fp8, x_scale, block_size=128)
+            w_deq = dequantize_fp8(w_fp8, w_scale, block_m=128, block_n=128)
+            out = x_deq @ w_deq.t()
 
-        # _scaled_mm: row-major A @ column-major B
-        # For A @ B.T: A row-major, B.T column-major means B is row-major then transposed
-        w_fp8_col = w_fp8.t()  # (K_padded, N_padded) column-major
-
-        out = torch._scaled_mm(
-            x_fp8, w_fp8_col,
-            scale_a=x_scale, scale_b=w_scale,
-            out_dtype=torch.bfloat16
-        )
-
-        # Unpad output
-        out = out[:M, :N]
-
-        # Save for backward
-        ctx.save_for_backward(x_fp8, x_scale, weight)
+        ctx.save_for_backward(x_fp8, x_scale, w_fp8, w_scale)
         ctx.x_shape = x_shape
-        ctx.x_orig = x_orig
-
+        ctx.round_scale = round_scale
         return out.reshape(*x_shape[:-1], -1)
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Backward using hardware FP8."""
-        x_fp8, x_scale, weight = ctx.saved_tensors
+        x_fp8, x_scale, w_fp8, w_scale = ctx.saved_tensors
         x_shape = ctx.x_shape
-        x_orig = ctx.x_orig
-        M, K = x_orig
+        round_scale = ctx.round_scale
 
-        grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()  # (M, N)
-        N = grad_flat.shape[1]
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
 
-        # ===== grad_x = grad @ W =====
-        # Pad inputs
-        grad_padded, _ = _pad_to_multiple(grad_flat)
-        w_padded, _ = _pad_to_multiple(weight)
+        grad_fp8, grad_scale = quantize_fp8_rowwise(grad_flat, block_size=128, round_scale=round_scale)
 
-        grad_fp8, grad_scale = _fp8_quantize_tensor(grad_padded)
+        if grad_output.is_cuda:
+            grad_x = fp8_matmul_dsv3(grad_fp8, w_fp8, grad_scale, w_scale)
+        else:
+            grad_deq = dequantize_fp8_rowwise(grad_fp8, grad_scale, block_size=128)
+            w_deq = dequantize_fp8(w_fp8, w_scale, block_m=128, block_n=128)
+            grad_x = grad_deq @ w_deq
 
-        # W is (N, K), need (N, K) column-major for matmul
-        # Transpose to (K, N), make contiguous, transpose back
-        w_t_cont = w_padded.t().contiguous()  # (K_pad, N_pad) row-major
-        w_t_fp8, w_t_scale = _fp8_quantize_tensor(w_t_cont)
-        w_col = w_t_fp8.t()  # (N_pad, K_pad) column-major
+        if grad_output.is_cuda:
+            grad_fp8_t, grad_scale_t = quantize_fp8_rowwise(
+                grad_flat.t().contiguous(), block_size=128, round_scale=round_scale
+            )
+            x_deq = dequantize_fp8_rowwise(x_fp8, x_scale, block_size=128)
+            x_fp8_block, x_scale_block = quantize_fp8_blockwise(
+                x_deq, block_m=128, block_n=128, round_scale=False
+            )
+            grad_weight = fp8_matmul_dsv3(grad_fp8_t, x_fp8_block, grad_scale_t, x_scale_block)
+        else:
+            grad_deq = dequantize_fp8_rowwise(grad_fp8, grad_scale, block_size=128)
+            x_deq = dequantize_fp8_rowwise(x_fp8, x_scale, block_size=128)
+            grad_weight = grad_deq.t() @ x_deq
 
-        grad_x = torch._scaled_mm(
-            grad_fp8, w_col,
-            scale_a=grad_scale, scale_b=w_t_scale,
-            out_dtype=torch.bfloat16
-        )
-        grad_x = grad_x[:M, :K].reshape(x_shape)
-
-        # ===== grad_W = grad.T @ x =====
-        # Dequant saved x_fp8 to get x back (only original size)
-        x_dequant = (x_fp8.float() * x_scale)[:M, :K]
-
-        # Pad both
-        grad_t = grad_flat.t().contiguous()  # (N, M)
-        grad_t_padded, _ = _pad_to_multiple(grad_t)
-        x_padded, _ = _pad_to_multiple(x_dequant)
-
-        grad_t_fp8, grad_t_scale = _fp8_quantize_tensor(grad_t_padded)
-
-        # x needs to be column-major
-        x_t_cont = x_padded.t().contiguous()  # (K_pad, M_pad) row-major
-        x_t_fp8, x_t_scale = _fp8_quantize_tensor(x_t_cont)
-        x_col = x_t_fp8.t()  # (M_pad, K_pad) column-major
-
-        grad_weight = torch._scaled_mm(
-            grad_t_fp8, x_col,
-            scale_a=grad_t_scale, scale_b=x_t_scale,
-            out_dtype=torch.bfloat16
-        )
-        grad_weight = grad_weight[:N, :K]
-
-        return grad_x, grad_weight
+        return grad_x.reshape(x_shape), grad_weight, None
 
 
 class FP8Linear(torch.nn.Module):
     """
-    FP8 Linear layer with true FP8 compute in both forward and backward.
+    FP8 Linear layer with DeepSeek-V3 style fine-grained quantization.
 
-    Uses custom autograd function with torch._scaled_mm for FP8 matmul
-    on SM89+ (Ada/Hopper) GPUs. Falls back to BF16 on older hardware.
-
-    Memory savings: ~4x for activations cached in backward
-    Compute savings: ~2x on SM89+ (true FP8 tensorcore ops)
+    - Activations: row-wise 1x128 scaling
+    - Weights: block-wise 128x128 scaling
     """
-    # Check for scaled_mm availability (PyTorch 2.1+, SM89+)
-    _HAS_SCALED_MM = hasattr(torch, '_scaled_mm')
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, round_scale: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.round_scale = round_scale
 
         # Master weights in FP32 for optimizer updates
         self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
@@ -807,11 +812,9 @@ class FP8Linear(torch.nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._HAS_SCALED_MM and x.is_cuda:
-            # True FP8 compute path with custom autograd
-            out = FP8MatmulFunction.apply(x, self.weight)
+        if x.is_cuda:
+            out = FP8MatmulFunction.apply(x, self.weight, self.round_scale)
         else:
-            # Fallback: standard BF16 matmul
             out = torch.nn.functional.linear(x, self.weight, None)
 
         if self.bias is not None:
@@ -819,9 +822,11 @@ class FP8Linear(torch.nn.Module):
         return out
 
     @classmethod
-    def from_linear(cls, linear: torch.nn.Linear) -> 'FP8Linear':
+    def from_linear(cls, linear: torch.nn.Linear, round_scale: bool = False) -> 'FP8Linear':
         """Convert an existing Linear layer to FP8Linear."""
-        fp8_linear = cls(linear.in_features, linear.out_features, bias=linear.bias is not None)
+        fp8_linear = cls(
+            linear.in_features, linear.out_features, bias=linear.bias is not None, round_scale=round_scale
+        )
         # Ensure weight is on same device/dtype as source
         fp8_linear.weight = torch.nn.Parameter(linear.weight.data.clone())
         if linear.bias is not None:
@@ -837,7 +842,7 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
     - embedding, lm_head (tied weights, need precision)
     - router (MoE gating, numerical stability)
     - norm layers (RMSNorm gamma)
-    - attention output projections (precision for residual)
+    - indexer (DSA stability)
 
     Args:
         model: The model to convert
@@ -850,12 +855,17 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
     default_exclude = [
         'embedding',
         'lm_head',
-        'router',      # MoE gating must stay high precision
-        'norm',        # RMSNorm
-        'w_out',       # Attention output projection
+        'router',       # MoE gating must stay high precision
+        'norm',         # RMSNorm
+        'indexer',      # DSA indexer stays high precision for stability
     ]
 
     exclude_names = (exclude_names or []) + default_exclude
+    round_scale_names = [
+        'w_out',  # Linear after attention
+        'w1',     # SwiGLU up-projection
+        'w2',     # SwiGLU up-projection
+    ]
 
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
@@ -873,7 +883,8 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
                 attr_name = name
 
             # Replace with FP8Linear
-            fp8_linear = FP8Linear.from_linear(module)
+            round_scale = any(key in name for key in round_scale_names)
+            fp8_linear = FP8Linear.from_linear(module, round_scale=round_scale)
             setattr(parent, attr_name, fp8_linear)
 
     return model
@@ -958,7 +969,7 @@ if __name__ == "__main__":
 
     q = torch.randn(batch, seq_len, n_head, d_head, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(batch, seq_len, d_head, dtype=torch.bfloat16, device="cuda")
-    w = torch.ones(n_head, dtype=torch.float32, device="cuda")
+    w = torch.randn(batch, seq_len, n_head, dtype=torch.float32, device="cuda")
 
     # Fused kernel
     out_fused = lightning_indexer_fused(q, k, w)
@@ -968,7 +979,7 @@ if __name__ == "__main__":
     # Reference implementation
     import torch.nn.functional as F
     scores_ref = F.relu(torch.einsum('bthd,bsd->bths', q.float(), k.float()))
-    out_ref = torch.einsum('bths,h->bts', scores_ref, w)
+    out_ref = torch.einsum('bths,bth->bts', scores_ref, w)
 
     # Compare
     rel_error = (out_ref - out_fused.float()).abs() / (out_ref.abs() + 1e-6)
@@ -987,7 +998,7 @@ if __name__ == "__main__":
     for seq_len in [512, 1024, 2048, 4096]:
         q = torch.randn(4, seq_len, 2, 64, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(4, seq_len, 64, dtype=torch.bfloat16, device="cuda")
-        w = torch.ones(2, dtype=torch.float32, device="cuda")
+        w = torch.randn(4, seq_len, 2, dtype=torch.float32, device="cuda")
 
         # Warmup
         for _ in range(3):

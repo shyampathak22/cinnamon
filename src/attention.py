@@ -1,22 +1,145 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
+from norm import RMSNorm
+
+
+class RoPE(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) as used in DeepSeek V3.
+
+    Standard RoPE rotates pairs of dimensions by position-dependent angles:
+    - For pair (x_0, x_1) at position t with frequency θ:
+      output = (x_0·cos(tθ) - x_1·sin(tθ), x_0·sin(tθ) + x_1·cos(tθ))
+
+    This is decoupled from content in MLA - applied only to separate
+    d_rope-dimensional key/query components, not the full representations.
+    """
+    def __init__(self, d_k, max_seq_len, base, original_seq_len=None, rope_factor=1.0,
+                 beta_fast=32, beta_slow=1):
+        super().__init__()
+        self.d_k = d_k
+        self.n_freq = d_k // 2
+        self.base = base
+        self.max_seq_len = max_seq_len
+        self.original_seq_len = original_seq_len if original_seq_len is not None else max_seq_len
+        self.rope_factor = rope_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+
+        # Frequencies: θ_i = base^(-2i/d) for i = 0, 1, ..., d/2-1
+        # This gives decreasing frequencies (slower rotation for higher dims)
+        freqs = base ** (-(torch.arange(0, d_k, 2, dtype=torch.float32) / d_k))
+        if max_seq_len > self.original_seq_len and self.rope_factor != 1.0:
+            low, high = self._find_correction_range(
+                self.beta_fast, self.beta_slow, d_k, base, self.original_seq_len
+            )
+            smooth = 1 - self._linear_ramp_factor(low, high, d_k // 2)
+            freqs = freqs / self.rope_factor * (1 - smooth) + freqs * smooth
+        self.register_buffer('freqs', freqs)
+
+        # Pre-compute angles for positions 0..max_seq_len-1
+        # Shape: (max_seq_len, n_freq)
+        pos = torch.arange(max_seq_len, dtype=torch.float32)
+        angles = torch.outer(pos, freqs)
+        self.register_buffer('cos_cached', angles.cos())
+        self.register_buffer('sin_cached', angles.sin())
+
+    @staticmethod
+    def _find_correction_dim(num_rotations, dim, base, max_seq_len):
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    @classmethod
+    def _find_correction_range(cls, low_rot, high_rot, dim, base, max_seq_len):
+        low = math.floor(cls._find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(cls._find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    @staticmethod
+    def _linear_ramp_factor(min_val, max_val, dim):
+        if min_val == max_val:
+            max_val += 0.001
+        linear = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+        return torch.clamp(linear, 0, 1)
+
+    def _extend_cache(self, seq_len):
+        """Extend cache for sequences longer than max_seq_len."""
+        if seq_len <= self.cos_cached.size(0):
+            return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+        pos = torch.arange(seq_len, device=self.freqs.device, dtype=self.freqs.dtype)
+        angles = torch.outer(pos, self.freqs)
+        return angles.cos(), angles.sin()
+
+    def forward(self, x, positions=None, interleaved=True):
+        """
+        Apply rotary embedding to input tensor.
+
+        Args:
+            x: (batch, seq, heads, d_k) or (batch, seq, k, d_k) for sparse keys
+            positions: optional position indices, shape (seq,), (batch, seq), or (batch, seq, k)
+            interleaved: if False, treat last dim as [real...imag...] instead of interleaved pairs
+
+        Returns:
+            Rotated tensor of same shape as input
+        """
+        seq_len = x.size(1)
+
+        if positions is None:
+            # Standard sequential positions
+            cos, sin = self._extend_cache(seq_len)
+            # Reshape for broadcasting: (seq, n_freq) -> (1, seq, 1, n_freq)
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
+        else:
+            # Custom positions (for sparse attention gathered keys)
+            pos = positions
+            if pos.dim() == 1:
+                pos = pos.unsqueeze(0)
+            if pos.dim() == 2:
+                pos = pos.unsqueeze(-1)
+            # Add trailing dimension for frequency broadcasting
+            pos = pos.unsqueeze(-1)  # (..., 1)
+            pos = pos.to(device=self.freqs.device, dtype=self.freqs.dtype)
+            # pos shape: (batch, seq, k, 1) or (batch, seq, 1, 1)
+            angles = pos * self.freqs  # broadcast to (..., n_freq)
+            cos = angles.cos()
+            sin = angles.sin()
+
+        # Split into real/imag pairs and rotate
+        # x shape: (..., d_k) where d_k = 2 * n_freq
+        if interleaved:
+            x1, x2 = x[..., ::2], x[..., 1::2]  # Even and odd indices
+        else:
+            half = x.size(-1) // 2
+            x1, x2 = x[..., :half], x[..., half:]
+
+        # Rotation: (x1, x2) -> (x1*cos - x2*sin, x1*sin + x2*cos)
+        out1 = x1 * cos - x2 * sin
+        out2 = x1 * sin + x2 * cos
+
+        if interleaved:
+            # Interleave back: [out1_0, out2_0, out1_1, out2_1, ...]
+            out = torch.stack([out1, out2], dim=-1).flatten(-2)
+        else:
+            # Concatenate real/imag blocks: [out_real..., out_imag...]
+            out = torch.cat([out1, out2], dim=-1)
+        return out
 
 
 class PoPE(nn.Module):
     """
     Polar Positional Encoding (PoPE) with learnable phase offset.
 
-    Uses d/2 frequencies to preserve dot-product compatibility:
+    Uses d frequencies and outputs 2d dimensions (cos/sin):
     - Query at pos t: [μ·cos(tθ), μ·sin(tθ)]
     - Key at pos s:   [μ·cos(sθ + δ), μ·sin(sθ + δ)]
     - q·k = Σ μ_q·μ_k·cos((s-t)θ + δ)
     """
-    def __init__(self, d_k, max_seq_len, base):
+    def __init__(self, d_k, max_seq_len, base, delta_init="zero"):
         super().__init__()
         self.d_k = d_k
-        self.n_freq = d_k // 2
+        self.n_freq = d_k
         self.base = base
         self.register_buffer('theta', base ** (-(torch.arange(self.n_freq, dtype=torch.float32) / self.n_freq)))
 
@@ -25,7 +148,9 @@ class PoPE(nn.Module):
         self.register_buffer('base_angles', torch.outer(pos, self.theta))
 
         # Learnable phase offset δ ∈ [-2π, 0]
-        self.raw_delta = nn.Parameter(torch.zeros(self.n_freq))
+        self.delta = nn.Parameter(torch.zeros(self.n_freq))
+        if delta_init == "uniform":
+            self.delta.data.uniform_(-2 * math.pi, 0.0)
 
     def _extend_base_angles(self, seq_len):
         """Extend cache for longer sequences."""
@@ -55,165 +180,345 @@ class PoPE(nn.Module):
             phases = pos[..., None] * self.theta
 
         if apply_delta:
-            delta = -2 * torch.pi * torch.sigmoid(self.raw_delta)
+            delta = self.delta.clamp(-2 * math.pi, 0.0)
             phases = phases + delta
 
-        # Single magnitude per frequency (shared across cos/sin)
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-        mu = F.softplus(x1 + x2)
+        # Magnitude per component (softplus), then polar -> Cartesian
+        mu = F.softplus(x)
         cos_out = mu * phases.cos()
         sin_out = mu * phases.sin()
         return torch.cat((cos_out, sin_out), dim=-1)
 
 
-class LightningIndexer(nn.Module):
-    """
-    Ultra-light scorer for sparse attention token selection (DeepSeek V3.2 style).
+def hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard transform over the last dimension."""
+    n = x.size(-1)
+    if n & (n - 1) != 0:
+        return x
+    h = x
+    step = 1
+    while step < n:
+        h = h.view(*h.shape[:-1], -1, 2, step)
+        a = h[..., 0, :]
+        b = h[..., 1, :]
+        h = torch.cat([a + b, a - b], dim=-1)
+        step *= 2
+    return h * (n ** -0.5)
 
-    Uses a fused Triton kernel that:
-    - Avoids materializing O(L² * n_head) intermediate tensor
-    - Computes in FP16 for memory efficiency
-    - Fuses ReLU + weighted sum into single pass
 
-    Memory: O(L²) in FP16 output only, vs O(L² * n_head) in FP32 intermediate
+class DSAIndexer(nn.Module):
     """
-    def __init__(self, d_model, n_head, d_head, n_indexer_heads):
+    DeepSeek Sparse Attention (DSA) lightning indexer.
+
+    Computes index scores:
+        I_{t,s} = sum_j w_{t,j} * ReLU(q^I_{t,j} · k^I_s)
+    """
+    def __init__(self, d_model, d_cq, n_heads, d_head, d_rope, max_seq_len, rope_base, rope_type,
+                 topk, use_fp8=True, use_hadamard=True, original_seq_len=None, rope_factor=1.0,
+                 beta_fast=32, beta_slow=1):
         super().__init__()
-        # Use fewer heads for indexer (DeepSeek style)
-        self.n_head = n_indexer_heads
+        self.n_heads = n_heads
         self.d_head = d_head
-        self.w_q = nn.Linear(d_model, n_indexer_heads * d_head, bias=False)
+        self.topk = topk
+        self.use_fp8 = use_fp8
+        self.use_hadamard = use_hadamard
+        self.softmax_scale = d_head ** -0.5
+        self.rope_type = rope_type
+
+        self.w_q = nn.Linear(d_cq, n_heads * d_head, bias=False)
         self.w_k = nn.Linear(d_model, d_head, bias=False)
-        self.w = nn.Parameter(torch.ones(n_indexer_heads))
+        self.k_norm = nn.LayerNorm(d_head)
+        self.weights_proj = nn.Linear(d_model, n_heads, bias=False)
 
-        # Try to import fused kernel
-        self._use_fused = False
-        self._warned_fallback = False
+        # Indexer positional encoding (RoPE per DSA paper)
+        self.rope = RoPE(
+            d_rope,
+            max_seq_len=max_seq_len,
+            base=rope_base,
+            original_seq_len=original_seq_len,
+            rope_factor=rope_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+        )
+
         try:
-            from kernels import lightning_indexer_fused
-            self._fused_fn = lightning_indexer_fused
-            self._use_fused = True
-        except ImportError:
-            pass
+            from kernels import quantize_fp8_rowwise
+            self._quantize_fp8_rowwise = quantize_fp8_rowwise
+        except Exception:
+            self._quantize_fp8_rowwise = None
 
-    def forward(self, h):
-        batch, seq, _ = h.shape
+    def _apply_indexer_rope(self, x, positions=None):
+        # DSA uses non-interleaved RoPE in the indexer.
+        return self.rope(x, positions=positions, interleaved=False)
 
-        q = self.w_q(h).view(batch, seq, self.n_head, self.d_head)
-        k = self.w_k(h)
+    def forward(self, x, q_latent, positions=None, mask=None, return_scores=False):
+        bsz, seqlen, _ = x.shape
+        q = self.w_q(q_latent).view(bsz, seqlen, self.n_heads, self.d_head)
+        k = self.k_norm(self.w_k(x))
 
-        if self._use_fused and h.is_cuda:
-            # Use fused Triton kernel (avoids O(L² * n_head) intermediate)
-            I = self._fused_fn(q, k, self.w)
+        # Apply partial RoPE to indexer queries/keys
+        rope_dim = min(self.rope.d_k, self.d_head)
+        if rope_dim > 0:
+            q_rope, q_nope = q[..., :rope_dim], q[..., rope_dim:]
+            k_rope, k_nope = k[..., :rope_dim], k[..., rope_dim:]
+            q_rope = self._apply_indexer_rope(q_rope, positions=None)
+            k_rope = self._apply_indexer_rope(k_rope.unsqueeze(2), positions=None).squeeze(2)
+            q = torch.cat([q_rope, q_nope], dim=-1)
+            k = torch.cat([k_rope, k_nope], dim=-1)
+
+        if self.use_hadamard:
+            q = hadamard_transform(q)
+            k = hadamard_transform(k)
+
+        weights = self.weights_proj(x.float()) * (self.n_heads ** -0.5)
+
+        if self.use_fp8 and x.is_cuda and self._quantize_fp8_rowwise is not None:
+            q_flat = q.reshape(-1, self.d_head).contiguous()
+            k_flat = k.reshape(-1, self.d_head).contiguous()
+            q_fp8, q_scale = self._quantize_fp8_rowwise(q_flat, block_size=128)
+            k_fp8, k_scale = self._quantize_fp8_rowwise(k_flat, block_size=128)
+            q_fp8 = q_fp8.view(bsz, seqlen, self.n_heads, self.d_head)
+            k_fp8 = k_fp8.view(bsz, seqlen, self.d_head)
+            q_scale = q_scale.view(bsz, seqlen, self.n_heads, -1)[..., 0]
+            k_scale = k_scale.view(bsz, seqlen, -1)[..., 0]
+
+            logits = torch.einsum('bthd,bsd->bths', q_fp8.float(), k_fp8.float())
+            logits = F.relu(logits) * (q_scale * weights * self.softmax_scale).unsqueeze(-1)
+            scores = logits.sum(dim=2) * k_scale
         else:
-            # Fallback: standard PyTorch (for CPU or if kernel unavailable)
-            if h.is_cuda and not self._use_fused and not self._warned_fallback:
-                warnings.warn(
-                    "LightningIndexer: fused kernel unavailable, using O(L² × n_head) fallback. "
-                    "This may cause OOM on long sequences.",
-                    RuntimeWarning
-                )
-                self._warned_fallback = True
-            scores = F.relu(torch.einsum('bthd,bsd->bths', q, k))
-            I = torch.einsum('bths,h->bts', scores, self.w)
+            logits = F.relu(torch.einsum('bthd,bsd->bths', q, k))
+            scores = torch.einsum('bths,bth->bts', logits, weights * self.softmax_scale)
 
-        return I
-    
-class TokenSelector(nn.Module):
-    def __init__(self, k, local_window):
-        super().__init__()
-        self.k = k
-        self.lw = local_window
+        if mask is not None:
+            scores = scores + mask
 
-    def forward(self, I):
-        _, q_len, k_len = I.shape
-        device = I.device
+        if return_scores:
+            return scores
 
-        q_pos = torch.arange(q_len, device=device).unsqueeze(1)
-        k_pos = torch.arange(k_len, device=device).unsqueeze(0)
-
-        local_mask = (k_pos >= q_pos - self.lw + 1) & (k_pos <= q_pos)
-        causal_mask = k_pos > q_pos
-
-        # Non-in-place masking to preserve gradients
-        I = I.masked_fill(local_mask, float('inf'))
-        I = I.masked_fill(causal_mask, float('-inf'))
-
-        k = min(self.k, k_len, q_len)
-        _, indices = I.topk(k, dim=-1)
-        return indices
+        topk = seqlen if self.topk <= 0 else min(seqlen, max(1, self.topk))
+        return scores.topk(topk, dim=-1).indices
 
 class MultiheadLatentAttention(nn.Module):
-    def __init__(self, d_model, d_ckv, d_cq, n_head, d_head, d_rope, max_seq_len, k_ts, local_window, n_indexer_heads, rope_base):
+    def __init__(self, d_model, d_ckv, d_cq, n_head, d_head, d_v, d_rope, max_seq_len,
+                 dsa_topk, local_window, n_indexer_heads, d_indexer_head, rms_eps,
+                 rope_base, rope_type='rope', pope_delta_init='zero',
+                 original_seq_len=None, rope_factor=1.0, beta_fast=32, beta_slow=1, mscale=1.0,
+                 indexer_use_fp8=True, indexer_use_hadamard=True):
         super().__init__()
         self.n_head = n_head
         self.d_head = d_head
-        self.w_dkv = nn.Linear(d_model, d_ckv, bias=False)
-        self.w_uk = nn.Linear(d_ckv, d_head*n_head, bias=False)
-        self.w_uv = nn.Linear(d_ckv, d_head*n_head, bias=False)
-        self.w_dq = nn.Linear(d_model, d_cq, bias=False)
-        self.w_uq = nn.Linear(d_cq, d_head*n_head, bias=False)
+        self.d_v = d_v
         self.d_rope = d_rope
-        self.w_qr = nn.Linear(d_cq, d_rope*n_head, bias=False)
-        self.w_kr = nn.Linear(d_model, d_rope, bias=False)
-        self.pope = PoPE(d_rope, max_seq_len, rope_base)
-        self.w_out = nn.Linear(d_head*n_head, d_model, bias=False)
-        self.light_sel = LightningIndexer(d_model, n_head, d_head, n_indexer_heads)
-        self.tok_sel = TokenSelector(k_ts, local_window)
+        self.rope_dim = d_rope * (2 if rope_type == 'pope' else 1)
+        self.rope_type = rope_type
+        self.dsa_topk = dsa_topk
+        self.local_window = local_window
+        self.original_seq_len = original_seq_len if original_seq_len is not None else max_seq_len
+        self.rope_factor = rope_factor
 
-    def sparse_attention(self, query, key, value, scale):
+        # Compressed KV and Q projections
+        self.w_dkv = nn.Linear(d_model, d_ckv, bias=False)
+        self.kv_norm = RMSNorm(d_ckv, eps=rms_eps)
+        self.w_uk = nn.Linear(d_ckv, d_head * n_head, bias=False)
+        self.w_uv = nn.Linear(d_ckv, d_v * n_head, bias=False)
+        self.w_dq = nn.Linear(d_model, d_cq, bias=False)
+        self.q_norm = RMSNorm(d_cq, eps=rms_eps)
+        self.w_uq = nn.Linear(d_cq, d_head * n_head, bias=False)
+
+        # Decoupled positional projections
+        self.w_qr = nn.Linear(d_cq, d_rope * n_head, bias=False)
+        self.w_kr = nn.Linear(d_model, d_rope, bias=False)
+
+        # Positional encoding: RoPE (default) or PoPE
+        if rope_type == 'rope':
+            self.pos_enc = RoPE(
+                d_rope,
+                max_seq_len,
+                rope_base,
+                original_seq_len=self.original_seq_len,
+                rope_factor=rope_factor,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+            )
+        elif rope_type == 'pope':
+            self.pos_enc = PoPE(d_rope, max_seq_len, rope_base, delta_init=pope_delta_init)
+        else:
+            raise ValueError(f"Unknown rope_type: {rope_type}. Use 'rope' or 'pope'.")
+
+        self.w_out = nn.Linear(d_v * n_head, d_model, bias=False)
+        self.indexer = DSAIndexer(
+            d_model, d_cq, n_indexer_heads, d_indexer_head, d_rope, max_seq_len,
+            rope_base, rope_type, dsa_topk, use_fp8=indexer_use_fp8,
+            use_hadamard=indexer_use_hadamard, original_seq_len=self.original_seq_len,
+            rope_factor=rope_factor, beta_fast=beta_fast, beta_slow=beta_slow
+        )
+        self.softmax_scale = (self.d_head + self.rope_dim) ** -0.5
+        if rope_type == 'rope' and max_seq_len > self.original_seq_len and rope_factor != 1.0:
+            scale = 0.1 * mscale * math.log(rope_factor) + 1.0
+            self.softmax_scale *= scale * scale
+
+    def sparse_attention(self, query, key, value, scale, return_weights=False):
         scores = torch.einsum('bhld,bhlkd->bhlk', query, key) * scale
         attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
         # Cast back to value dtype for einsum compatibility
         attn_weights = attn_weights.to(value.dtype)
         output = torch.einsum('bhlk,bhlkd->bhld', attn_weights, value)
+        if return_weights:
+            return output, attn_weights
         return output
 
-    def forward(self, x):
-        batch_size = x.size(0)
-        c_kv = self.w_dkv(x)
-        I = self.light_sel(x)
-        idx = self.tok_sel(I)
+    def forward(self, x, dsa_warmup=False, compute_aux=False):
+        batch_size, seq_len, _ = x.size()
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=x.device),
+            diagonal=1
+        ).unsqueeze(0)
 
-        # Single gather for both c_kv and x (same indices, halves memory bandwidth)
-        batch_idx = torch.arange(batch_size, device=x.device)[:, None, None]
-        combined = torch.cat([c_kv, x], dim=-1)  # (batch, L, d_ckv + d_model)
-        combined_selected = combined[batch_idx, idx]  # (batch, L, k, d_ckv + d_model)
-        ckv_selected = combined_selected[..., :c_kv.size(-1)]  # (batch, L, k, d_ckv)
-        x_selected = combined_selected[..., c_kv.size(-1):]    # (batch, L, k, d_model)
+        c_kv = self.kv_norm(self.w_dkv(x))
+        c_q = self.q_norm(self.w_dq(x))
 
-        key_c = self.w_uk(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
-        value = self.w_uv(ckv_selected).view(batch_size, ckv_selected.size(1), ckv_selected.size(2), self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
-        c_q = self.w_dq(x)
-        query_c = self.w_uq(c_q).view(batch_size, -1, self.n_head, self.d_head).transpose(1, 2)
+        index_scores = self.indexer(
+            x.detach(),
+            c_q.detach(),
+            mask=causal_mask,
+            return_scores=True
+        )
 
-        query_r = self.pope(
-            self.w_qr(c_q).view(batch_size, -1, self.n_head, self.d_rope),
-            apply_delta=False
-        ).transpose(1, 2)
-        ker_r_pre = self.w_kr(x_selected)
-        key_r = self.pope(ker_r_pre, apply_delta=True, positions=idx)
-        key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1, -1)
-        query = torch.cat((query_c, query_r), dim=-1)
-        key = torch.cat((key_c, key_r), dim=-1)
+        idx = None
+        if not dsa_warmup:
+            topk = seq_len if self.dsa_topk <= 0 else min(self.dsa_topk, seq_len)
+            if self.local_window > 0:
+                topk = min(seq_len, max(topk, self.local_window))
+                offsets = torch.arange(seq_len, device=x.device)
+                local_mask = (offsets[None, :] - offsets[:, None])
+                local_mask = (local_mask <= 0) & (local_mask > -self.local_window)
+                index_scores = index_scores + local_mask.unsqueeze(0).to(index_scores.dtype) * 1e4
+            idx = index_scores.topk(topk, dim=-1).indices
 
-        attn_o = self.sparse_attention(query, key, value, scale=(self.d_head + self.d_rope)**-0.5)
-        attn_o = attn_o.transpose(1, 2).reshape(batch_size, -1, self.d_head*self.n_head)
-        return self.w_out(attn_o)
+            # Single gather for both c_kv and x (same indices, halves memory bandwidth)
+            batch_idx = torch.arange(batch_size, device=x.device)[:, None, None]
+            combined = torch.cat([c_kv, x], dim=-1)
+            combined_selected = combined[batch_idx, idx]
+            ckv_selected = combined_selected[..., :c_kv.size(-1)]
+            x_selected = combined_selected[..., c_kv.size(-1):]
+
+        query_c = self.w_uq(c_q).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
+        q_rope_input = self.w_qr(c_q).view(batch_size, seq_len, self.n_head, self.d_rope)
+
+        if self.rope_type == 'rope':
+            query_r = self.pos_enc(q_rope_input, interleaved=True).transpose(1, 2)
+        else:
+            query_r = self.pos_enc(q_rope_input, apply_delta=False).transpose(1, 2)
+
+        scale = self.softmax_scale
+
+        if dsa_warmup:
+            key_c = self.w_uk(c_kv).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
+            value = self.w_uv(c_kv).view(batch_size, seq_len, self.n_head, self.d_v).transpose(1, 2)
+            k_rope_input = self.w_kr(x).unsqueeze(2)
+            if self.rope_type == 'rope':
+                key_r = self.pos_enc(k_rope_input, interleaved=True).squeeze(2)
+            else:
+                key_r = self.pos_enc(k_rope_input, apply_delta=True).squeeze(2)
+            key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1)
+
+            query = torch.cat((query_c, query_r), dim=-1)
+            key = torch.cat((key_c, key_r), dim=-1)
+
+            scores = torch.einsum('bhld,bhsd->bhls', query, key) * scale
+            scores = scores + causal_mask.unsqueeze(1)
+            attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(value.dtype)
+            attn_o = torch.einsum('bhls,bhsd->bhld', attn_weights, value)
+        else:
+            key_c = self.w_uk(ckv_selected).view(batch_size, seq_len, -1, self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
+            value = self.w_uv(ckv_selected).view(batch_size, seq_len, -1, self.n_head, self.d_v).permute(0, 3, 1, 2, 4)
+            k_rope_input = self.w_kr(x_selected)
+            if self.rope_type == 'rope':
+                key_r = self.pos_enc(k_rope_input, positions=idx, interleaved=True)
+            else:
+                key_r = self.pos_enc(k_rope_input, apply_delta=True, positions=idx)
+            key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1, -1)
+
+            query = torch.cat((query_c, query_r), dim=-1)
+            key = torch.cat((key_c, key_r), dim=-1)
+
+            attn_o, attn_weights = self.sparse_attention(query, key, value, scale=scale, return_weights=True)
+
+        attn_o = attn_o.transpose(1, 2).reshape(batch_size, seq_len, self.n_head * self.d_v)
+        out = self.w_out(attn_o)
+
+        aux_loss = None
+        if compute_aux:
+            p = attn_weights.sum(dim=1)
+            p = p / (p.sum(dim=-1, keepdim=True) + 1e-9)
+            if dsa_warmup:
+                log_q = F.log_softmax(index_scores, dim=-1)
+                log_q = log_q.masked_fill(~torch.isfinite(index_scores), 0.0)
+            else:
+                log_q = F.log_softmax(index_scores.gather(-1, idx), dim=-1)
+            p = p.detach()
+            aux_loss = (p * (p.clamp_min(1e-9).log() - log_q)).sum(dim=-1).mean()
+
+        return out, aux_loss
     
 if __name__ == "__main__":
     from config import ModelConfig
     cfg = ModelConfig()
 
-    # Test MLA
-    mla = MultiheadLatentAttention(
-        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head,
-        cfg.d_rope, cfg.max_seq_len, cfg.k_ts, cfg.local_window,
-        cfg.n_indexer_heads, cfg.rope_base
+    print("=" * 60)
+    print("Testing RoPE")
+    print("=" * 60)
+
+    # Test RoPE
+    rope = RoPE(cfg.d_rope, cfg.max_seq_len, cfg.rope_base)
+    x = torch.randn(4, 128, 8, cfg.d_rope)
+    out = rope(x)
+    print(f"RoPE input shape: {x.shape}, output shape: {out.shape}")
+
+    # Test RoPE with custom positions (for sparse attention)
+    positions = torch.randint(0, 128, (4, 128, 32))  # (batch, seq, k)
+    x_sparse = torch.randn(4, 128, 32, cfg.d_rope)
+    out_sparse = rope(x_sparse, positions=positions)
+    print(f"RoPE sparse input: {x_sparse.shape}, positions: {positions.shape}, output: {out_sparse.shape}")
+
+    print("\n" + "=" * 60)
+    print("Testing MLA with RoPE (default)")
+    print("=" * 60)
+
+    # Test MLA with RoPE
+    mla_rope = MultiheadLatentAttention(
+        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
+        cfg.d_rope, cfg.max_seq_len, cfg.dsa_topk, cfg.local_window,
+        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
+        cfg.rope_base, rope_type='rope', pope_delta_init=cfg.pope_delta_init,
+        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
+        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
+        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
     )
     x = torch.randn(4, 128, cfg.d_model)
-    out = mla(x)
-    print(f"MLA output shape: {out.shape}")
+    out, _ = mla_rope(x)
+    print(f"MLA (RoPE) output shape: {out.shape}")
+
+    print("\n" + "=" * 60)
+    print("Testing MLA with PoPE")
+    print("=" * 60)
+
+    # Test MLA with PoPE
+    mla_pope = MultiheadLatentAttention(
+        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
+        cfg.d_rope, cfg.max_seq_len, cfg.dsa_topk, cfg.local_window,
+        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
+        cfg.rope_base, rope_type='pope', pope_delta_init=cfg.pope_delta_init,
+        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
+        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
+        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
+    )
+    out, _ = mla_pope(x)
+    print(f"MLA (PoPE) output shape: {out.shape}")
+
+    print("\n" + "=" * 60)
+    print("Testing PoPE extrapolation")
+    print("=" * 60)
 
     # Test PoPE extrapolation
     pope = PoPE(cfg.d_rope, cfg.max_seq_len, cfg.rope_base)
@@ -223,25 +528,37 @@ if __name__ == "__main__":
         out = pope(x)
         print(f"PoPE seq_len={seq_len}: {out.shape}")
 
-    # Test LightningIndexer
-    indexer = LightningIndexer(cfg.d_model, cfg.n_heads, cfg.d_head, cfg.n_indexer_heads)
+    print("\n" + "=" * 60)
+    print("Testing DSAIndexer")
+    print("=" * 60)
+
+    indexer = DSAIndexer(
+        cfg.d_model, cfg.d_cq, cfg.n_indexer_heads, cfg.d_indexer_head,
+        cfg.d_rope, cfg.max_seq_len, cfg.rope_base, cfg.rope_type,
+        cfg.dsa_topk, use_fp8=cfg.indexer_use_fp8, use_hadamard=cfg.indexer_use_hadamard,
+        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
+        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow
+    )
     h = torch.randn(4, 128, cfg.d_model)
-    relevance = indexer(h)
-    print(f"LightningIndexer relevance shape: {relevance.shape}")
+    q_latent = torch.randn(4, 128, cfg.d_cq)
+    scores = indexer(h, q_latent, return_scores=True)
+    indices = indexer(h, q_latent, return_scores=False)
+    print(f"DSAIndexer scores shape: {scores.shape}, indices shape: {indices.shape}")
 
-    # Test TokenSelector
-    selector = TokenSelector(k=32, local_window=8)
-    I = torch.randn(4, 64, 64)
-    indices = selector(I)
-    print(f"TokenSelector indices shape: {indices.shape}")
+    print("\n" + "=" * 60)
+    print("Benchmark MLA (RoPE) at different sequence lengths")
+    print("=" * 60)
 
-    # Benchmark MLA at different sequence lengths
     import time
     torch.cuda.empty_cache()
     mla_sparse = MultiheadLatentAttention(
-        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head,
-        cfg.d_rope, 16384, cfg.k_ts, cfg.local_window,
-        cfg.n_indexer_heads, cfg.rope_base
+        cfg.d_model, cfg.d_ckv, cfg.d_cq, cfg.n_heads, cfg.d_head, cfg.d_v,
+        cfg.d_rope, 16384, cfg.dsa_topk, cfg.local_window,
+        cfg.n_indexer_heads, cfg.d_indexer_head, cfg.rms_eps,
+        cfg.rope_base, rope_type='rope', pope_delta_init=cfg.pope_delta_init,
+        original_seq_len=cfg.original_seq_len, rope_factor=cfg.rope_factor,
+        beta_fast=cfg.beta_fast, beta_slow=cfg.beta_slow, mscale=cfg.mscale,
+        indexer_use_fp8=cfg.indexer_use_fp8, indexer_use_hadamard=cfg.indexer_use_hadamard
     )
     mla_sparse.cuda()
 
@@ -250,8 +567,12 @@ if __name__ == "__main__":
         x = torch.randn(1, seq_len, cfg.d_model).cuda()
         torch.cuda.synchronize()
         start = time.perf_counter()
-        out = mla_sparse(x)
+        out, _ = mla_sparse(x)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         print(f"seq_len={seq_len}: {elapsed*1000:.1f}ms, shape={out.shape}")
         del x, out
+
+    print("\n" + "=" * 60)
+    print("All tests passed!")
+    print("=" * 60)
