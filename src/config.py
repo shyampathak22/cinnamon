@@ -12,7 +12,7 @@ class ModelConfig:
     d_cq: int = 128   # q_lora_rank in MLA
     d_head: int = 32  # qk_nope_head_dim in MLA
     d_v: int = 32     # v_head_dim in MLA (default: same as d_head)
-    d_rope: int = 16  # qk_rope_head_dim in MLA (base dim for PoPE)
+    d_rope: int = 64  # qk_rope_head_dim in MLA (base dim for PoPE)
     n_routed: int = 8
     n_shared: int = 1
     top_k: int = 2
@@ -34,11 +34,11 @@ class ModelConfig:
     beta_slow: int = 1
     mscale: float = 1.0
     rope_type: str = 'rope'  # 'rope' (standard RoPE) or 'pope' (Polar PE)
-    pope_delta_init: str = "uniform"  # "zero" or "uniform"
+    pope_delta_init: str = "zero"  # "zero" or "uniform"
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-4
+    lr: float = 6e-4
     max_tokens: int = 1000000000  # 1B tokens for quick baseline
     batch_size: int = 2
     accumulation_steps: int = 16  # Doubled to maintain effective batch size

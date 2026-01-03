@@ -36,16 +36,22 @@ CONFIGS = {
     "pope": {"rope_type": "pope", "rope_factor": 1.0},
 }
 
-TRAINING_SEQ_LEN = 2048  # All models trained at this final length
-ORIGINAL_SEQ_LEN = 1024  # YaRN reference length
+TRAINING_SEQ_LEN = 1024  # All models trained at this final length
+ORIGINAL_SEQ_LEN = 512  # YaRN reference length
 
 
 def infer_config(checkpoint_path: Path) -> dict:
     """Infer rope_type and rope_factor from checkpoint directory name."""
     dir_name = checkpoint_path.parent.name
-    if dir_name not in CONFIGS:
-        raise ValueError(f"Unknown checkpoint directory: {dir_name}. Expected one of {list(CONFIGS.keys())}")
-    return CONFIGS[dir_name]
+    # Match directory names containing the config key (e.g., "rope-d_rope64-..." matches "rope")
+    if "rope-yarn" in dir_name:
+        return CONFIGS["rope-yarn"]
+    elif "pope" in dir_name:
+        return CONFIGS["pope"]
+    elif "rope" in dir_name:
+        return CONFIGS["rope"]
+    else:
+        raise ValueError(f"Unknown checkpoint directory: {dir_name}. Expected directory containing 'rope', 'rope-yarn', or 'pope'")
 
 
 def load_model(checkpoint_path: Path, max_seq_len: int, device: torch.device) -> torch.nn.Module:
@@ -212,13 +218,17 @@ def main():
         print("=" * 70)
         print(f"* = best | Training length: {TRAINING_SEQ_LEN}")
 
-        # Degradation analysis
-        print("\nDegradation (2048 -> 8192):")
-        for r in all_results:
-            ppl_2k = next(x["perplexity"] for x in r["results"] if x["seq_len"] == 2048)
-            ppl_8k = next(x["perplexity"] for x in r["results"] if x["seq_len"] == 8192)
-            ratio = ppl_8k / ppl_2k
-            print(f"  {r['name']:>10}: {ppl_2k:.1f} -> {ppl_8k:.1f} ({ratio:.2f}x)")
+        # Degradation analysis (training length -> max tested length)
+        max_len = max(lengths)
+        train_len = min(l for l in lengths if l >= TRAINING_SEQ_LEN) if any(l >= TRAINING_SEQ_LEN for l in lengths) else lengths[0]
+        if max_len > train_len:
+            print(f"\nDegradation ({train_len} -> {max_len}):")
+            for r in all_results:
+                ppl_train = next((x["perplexity"] for x in r["results"] if x["seq_len"] == train_len), None)
+                ppl_max = next((x["perplexity"] for x in r["results"] if x["seq_len"] == max_len), None)
+                if ppl_train and ppl_max:
+                    ratio = ppl_max / ppl_train
+                    print(f"  {r['name']:>10}: {ppl_train:.1f} -> {ppl_max:.1f} ({ratio:.2f}x)")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
