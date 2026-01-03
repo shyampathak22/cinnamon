@@ -25,6 +25,11 @@ from dataclasses import asdict
 
 DATA_DIR = Path(__file__).parent.parent / "artifacts" / "tokenized_data"
 CHECKPOINT_DIR = Path(__file__).parent.parent / "artifacts" / "checkpoints"
+_DROP_BUFFER_SUFFIXES = (".cos_cached", ".sin_cached", ".base_angles")
+
+
+def _strip_position_buffers(state_dict: dict) -> dict:
+    return {k: v for k, v in state_dict.items() if not k.endswith(_DROP_BUFFER_SUFFIXES)}
 
 class ShardedDataset(IterableDataset):
     
@@ -63,7 +68,7 @@ def setup_ddp():
     return rank, local_rank, world_size
 
 class Trainer():
-    def __init__(self, model, config, model_config, rank, local_rank, world_size):
+    def __init__(self, model, config, model_config, rank, local_rank, world_size, wandb_project="cinnamon", run_name=None):
         self.seed = config.seed
         self.set_seed(self.seed)
         self.model = model
@@ -72,22 +77,8 @@ class Trainer():
         self.rank = rank
         self.local_rank = local_rank
         self.world_size = world_size
-        train_dataset = ShardedDataset(DATA_DIR, "train", config.seq_len, self.rank, self.world_size, self.seed)
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None
-        )
-        val_dataset = ShardedDataset(DATA_DIR, "val", config.seq_len, self.rank, self.world_size, self.seed)
-        self.val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None
-        )
+        self.train_loader = self._build_loader("train", config.seq_len)
+        self.val_loader = self._build_loader("val", config.seq_len)
         indexer_decay = []
         indexer_no_decay = []
         main_decay = []
@@ -117,16 +108,65 @@ class Trainer():
         self.num_params = sum(p.numel() for p in self.model.parameters())
         self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
+        self._seq_len_switched = False
         # Note: GradScaler removed - not needed for BF16 (only for FP16)
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        self._wandb_run = None
         if self.rank == 0:
-            wandb.init(project='cinnamon', config={**asdict(config), **asdict(model_config), "num_params": self.num_params, "max_steps": config.max_steps, "warmup_steps": config.warmup_steps})
+            self._wandb_run = wandb.init(
+                project=wandb_project,
+                name=run_name,
+                config={**asdict(config), **asdict(model_config), "num_params": self.num_params, "max_steps": config.max_steps, "warmup_steps": config.warmup_steps},
+            )
 
     def set_seed(self, seed):
       random.seed(seed)
       np.random.seed(seed)
       torch.manual_seed(seed)
       torch.cuda.manual_seed_all(seed)
+
+    def _build_loader(self, split, seq_len):
+        dataset = ShardedDataset(DATA_DIR, split, seq_len, self.rank, self.world_size, self.seed)
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory,
+            prefetch_factor=self.config.prefetch_factor if self.config.num_workers > 0 else None,
+        )
+
+    def _set_seq_len(self, seq_len):
+        self.config.seq_len = seq_len
+        self.train_loader = self._build_loader("train", seq_len)
+        self.val_loader = self._build_loader("val", seq_len)
+        self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
+        self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
+        self.scheduler = LambdaLR(
+            self.optimizer,
+            lr_lambda=self.get_lr_lambda(self.config.warmup_steps, self.config.max_steps),
+            last_epoch=self.step - 1,
+        )
+
+    def _maybe_switch_seq_len(self, dsa_warmup):
+        target = self.config.seq_len_final
+        if dsa_warmup or self._seq_len_switched or not target:
+            return False
+        if target == self.config.seq_len:
+            self._seq_len_switched = True
+            return False
+        if self.rank == 0:
+            print(f"Switching seq_len from {self.config.seq_len} to {target} after DSA warmup.")
+        self._seq_len_switched = True
+        self._set_seq_len(target)
+        return True
+
+    def load_state(self, checkpoint, load_optimizer=True):
+        if load_optimizer and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if load_optimizer and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.step = int(checkpoint.get("step", 0))
+        self.tokens_seen = int(checkpoint.get("tokens_seen", 0))
 
     def get_lr_lambda(self, warmup_steps, max_steps, min_lr_ratio=0.1):
         def lr_lambda(step):
@@ -188,16 +228,19 @@ class Trainer():
             mtp_lambda = self.get_mtp_lambda()
 
             aux_loss = 0.0
+            aux_loss_value = 0.0
             if dsa_kl is not None:
                 aux_loss = aux_loss + self.config.dsa_kl_weight * dsa_kl
+                aux_loss_value += (self.config.dsa_kl_weight * dsa_kl).item()
             if moe_balance is not None:
                 aux_loss = aux_loss + moe_balance
+                aux_loss_value += moe_balance.item()
 
             loss = (main_loss + mtp_lambda * mtp_loss + aux_loss) / self.config.accumulation_steps
 
         # BF16 doesn't need GradScaler - direct backward
         loss.backward()
-        return loss * self.config.accumulation_steps, mtp_loss, main_loss, dsa_kl, moe_balance
+        return loss * self.config.accumulation_steps, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda
 
     @torch.no_grad()
     def val_step(self, batch):
@@ -255,8 +298,13 @@ class Trainer():
             for batch in self.train_loader:
                 dsa_warmup = self.step < self.config.dsa_warmup_steps
                 self._set_dsa_warmup_state(dsa_warmup)
+                if self._maybe_switch_seq_len(dsa_warmup):
+                    if self.rank == 0:
+                        pbar.total = self.config.max_steps
+                        pbar.refresh()
+                    break
                 start_t = time.perf_counter()
-                loss, mtp_loss, main_loss, dsa_kl, moe_balance = self.train_step(batch)
+                loss, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda = self.train_step(batch)
                 end_t = time.perf_counter()
                 accum_time += (end_t - start_t)
                 microstep += 1
@@ -266,7 +314,7 @@ class Trainer():
                 else:
                     self._set_moe_gamma(self.model_config.gamma)
                 if microstep % self.config.accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip).item()
                     self.optimizer.step()
                     if not dsa_warmup:
                         self.scheduler.step()
@@ -292,27 +340,48 @@ class Trainer():
                         ema_tok_per_sec = 0.9 * ema_tok_per_sec + (0.1) * tok_per_sec
                     if self.rank == 0:
                         pbar.set_postfix_str(f"loss: {loss.item():.4f} | ema loss: {ema_loss:.4f} | tok/s: {ema_tok_per_sec:.2f} | mfu: {ema_mfu * 100:.2f}% | tokens_seen: {self.tokens_seen/1e9:.2f}B")
-                        wandb.log({"train/loss": loss.item(),
-                                "train/ema_loss": ema_loss,
-                                "model/lr": self.scheduler.get_last_lr()[0],
+                        if self._wandb_run is not None:
+                            lr_main = None
+                            lr_indexer = None
+                            for group in self.optimizer.param_groups:
+                                if group.get("group") == "main" and lr_main is None:
+                                    lr_main = group.get("lr")
+                                if group.get("group") == "indexer" and lr_indexer is None:
+                                    lr_indexer = group.get("lr")
+                            wandb.log({
+                                "train/loss": loss.item(),
+                                "train/aux_loss": aux_loss_value,
+                                "train/mtp_lambda": mtp_lambda,
+                                "train/grad_norm": grad_norm,
                                 "train/step": self.step,
                                 "train/tokens_seen": self.tokens_seen,
+                                "train/tok_per_sec": tok_per_sec,
+                                "train/step_time_ms": elapsed_t * 1000.0,
                                 "train/mtp_loss": mtp_loss.item(),
                                 "train/main_loss": main_loss.item(),
                                 "train/dsa_kl": dsa_kl.item() if dsa_kl is not None else 0.0,
-                                "train/moe_balance": moe_balance.item() if moe_balance is not None else 0.0
-                                })
+                                "train/moe_balance": moe_balance.item() if moe_balance is not None else 0.0,
+                                "train/dsa_warmup": int(dsa_warmup),
+                                "train/moe_gamma": self._gamma_active,
+                                "train/seq_len": self.config.seq_len,
+                                "train/lr_main": lr_main,
+                                "train/lr_indexer": lr_indexer,
+                            })
                     if self.step % self.config.eval_steps == 0 and self.step > 0:
                         self.model.eval()
                         eval_loss, eval_main_loss, eval_mtp_loss = self.val()
                         if self.rank == 0:
                             print(f"Eval Perplexity: {math.exp(eval_main_loss):.4f}")
-                        if self.rank == 0:
-                            wandb.log({"eval/loss": eval_loss,
-                                       "eval/main_loss": eval_main_loss,
-                                       "eval/mtp_loss": eval_mtp_loss,
-                                    "eval/perplexity": math.exp(eval_loss)
-                                    })
+                        if self.rank == 0 and self._wandb_run is not None:
+                            wandb.log({
+                                "eval/loss": eval_loss,
+                                "eval/main_loss": eval_main_loss,
+                                "eval/mtp_loss": eval_mtp_loss,
+                                "eval/perplexity": math.exp(eval_loss),
+                                "eval/main_perplexity": math.exp(eval_main_loss),
+                                "eval/mtp_perplexity": math.exp(eval_mtp_loss),
+                                "eval/tokens_seen": self.tokens_seen,
+                            })
                         self.model.train()
                     if self.step % self.config.checkpoint_steps == 0 and self.step > 0:
                         if self.rank == 0:
@@ -338,7 +407,32 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--rope', action='store_true', help='Use standard RoPE (default)')
     group.add_argument('--pope', action='store_true', help='Use Polar Position Embedding')
+    parser.add_argument('--run-name', type=str, default=None)
+    parser.add_argument('--wandb-project', type=str, default='cinnamon')
+    parser.add_argument('--resume', type=Path, default=None, help="Path to checkpoint to resume")
+    parser.add_argument('--load-weights-only', action='store_true', help="Load model weights only (reset optimizer/scheduler)")
+    parser.add_argument('--seq-len', type=int, default=None)
+    parser.add_argument('--max-seq-len', type=int, default=None)
+    parser.add_argument('--original-seq-len', type=int, default=None)
+    parser.add_argument('--rope-factor', type=float, default=None)
+    parser.add_argument('--beta-fast', type=int, default=None)
+    parser.add_argument('--beta-slow', type=int, default=None)
+    parser.add_argument('--mscale', type=float, default=None)
+    parser.add_argument('--max-tokens', type=int, default=None)
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--accumulation-steps', type=int, default=None)
+    parser.add_argument('--seq-len-final', type=int, default=None)
+    parser.add_argument('--eval-steps', type=int, default=None)
+    parser.add_argument('--checkpoint-steps', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--weight-decay', type=float, default=None)
+    parser.add_argument('--dsa-warmup-steps', type=int, default=None)
+    parser.add_argument('--dsa-warmup-lr', type=float, default=None)
+    parser.add_argument('--disable-fp8', action='store_true')
     args = parser.parse_args()
+
+    if args.load_weights_only and args.resume is None:
+        parser.error("--load-weights-only requires --resume")
 
     # Determine rope_type from CLI args
     if args.pope:
@@ -351,6 +445,67 @@ if __name__ == "__main__":
     model_config = ModelConfig()
     model_config.rope_type = rope_type  # Override from CLI
     train_config = TrainConfig()
+
+    if args.seq_len is not None:
+        train_config.seq_len = args.seq_len
+    if args.seq_len_final is not None:
+        train_config.seq_len_final = args.seq_len_final
+    if args.max_tokens is not None:
+        train_config.max_tokens = args.max_tokens
+    if args.batch_size is not None:
+        train_config.batch_size = args.batch_size
+    if args.accumulation_steps is not None:
+        train_config.accumulation_steps = args.accumulation_steps
+    if args.eval_steps is not None:
+        train_config.eval_steps = args.eval_steps
+    if args.checkpoint_steps is not None:
+        train_config.checkpoint_steps = args.checkpoint_steps
+    if args.lr is not None:
+        train_config.lr = args.lr
+    if args.weight_decay is not None:
+        train_config.weight_decay = args.weight_decay
+    if args.dsa_warmup_steps is not None:
+        train_config.dsa_warmup_steps = args.dsa_warmup_steps
+    if args.dsa_warmup_lr is not None:
+        train_config.dsa_warmup_lr = args.dsa_warmup_lr
+    if args.disable_fp8:
+        train_config.use_fp8 = False
+
+    if args.rope_factor is not None:
+        model_config.rope_factor = args.rope_factor
+    if args.beta_fast is not None:
+        model_config.beta_fast = args.beta_fast
+    if args.beta_slow is not None:
+        model_config.beta_slow = args.beta_slow
+    if args.mscale is not None:
+        model_config.mscale = args.mscale
+
+    if args.original_seq_len is not None:
+        model_config.original_seq_len = args.original_seq_len
+    else:
+        if model_config.original_seq_len != train_config.seq_len and rank == 0:
+            print(
+                f"Aligning original_seq_len ({model_config.original_seq_len}) "
+                f"to training seq_len ({train_config.seq_len}) for YaRN."
+            )
+        model_config.original_seq_len = train_config.seq_len
+
+    if args.max_seq_len is not None:
+        model_config.max_seq_len = args.max_seq_len
+    if model_config.max_seq_len < train_config.seq_len:
+        if rank == 0:
+            print(
+                f"Raising max_seq_len ({model_config.max_seq_len}) "
+                f"to training seq_len ({train_config.seq_len})."
+            )
+        model_config.max_seq_len = train_config.seq_len
+    if train_config.seq_len_final is not None and model_config.max_seq_len < train_config.seq_len_final:
+        if rank == 0:
+            print(
+                f"Raising max_seq_len ({model_config.max_seq_len}) "
+                f"to final seq_len ({train_config.seq_len_final})."
+            )
+        model_config.max_seq_len = train_config.seq_len_final
 
     if rank == 0:
         print(f"Initializing Cinnamon model with {rope_type.upper()} positional encoding...")
@@ -387,17 +542,44 @@ if __name__ == "__main__":
                      model_config.mscale,
                      model_config.indexer_use_fp8,
                      model_config.indexer_use_hadamard)
+    resume_state = None
+    if args.resume is not None:
+        resume_state = torch.load(args.resume, map_location="cpu")
+        state_dict = resume_state["model_state_dict"] if "model_state_dict" in resume_state else resume_state
+        state_dict = _strip_position_buffers(state_dict)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        missing = [k for k in incompatible.missing_keys if not k.endswith(_DROP_BUFFER_SUFFIXES)]
+        unexpected = [k for k in incompatible.unexpected_keys if not k.endswith(_DROP_BUFFER_SUFFIXES)]
+        if missing or unexpected:
+            raise RuntimeError(f"Unexpected state dict keys. Missing: {missing}, Unexpected: {unexpected}")
+        if rank == 0:
+            print(f"Loaded checkpoint weights from {args.resume}")
     if train_config.use_fp8:
         from kernels import convert_to_fp8
         model = convert_to_fp8(model)
         if rank == 0:
             print("FP8 training enabled (SM89+ for compute benefits, otherwise storage-only)")
     model.to(local_rank)
-    model = DDP(model, device_ids=[local_rank])
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     model = torch.compile(model)  # Default mode works best with DDP + MoE
     if rank == 0:
         print("Initializing trainer...")
-    trainer = Trainer(model, train_config, model_config, rank, local_rank, world_size)
+    trainer = Trainer(
+        model,
+        train_config,
+        model_config,
+        rank,
+        local_rank,
+        world_size,
+        wandb_project=args.wandb_project,
+        run_name=args.run_name,
+    )
+    if resume_state is not None and not args.load_weights_only:
+        trainer.load_state(resume_state, load_optimizer=True)
+        if rank == 0:
+            print(f"Resumed optimizer/scheduler from {args.resume}")
+    if resume_state is not None and args.load_weights_only and rank == 0:
+        print("Loaded weights only; optimizer/scheduler state reset.")
     if rank == 0:
         print(f"Model and trainer initialized!\nParameters: {trainer.num_params}")
     trainer.train()

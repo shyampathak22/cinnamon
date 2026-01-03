@@ -286,7 +286,7 @@ class DSAIndexer(nn.Module):
 
             logits = torch.einsum('bthd,bsd->bths', q_fp8.float(), k_fp8.float())
             logits = F.relu(logits) * (q_scale * weights * self.softmax_scale).unsqueeze(-1)
-            scores = logits.sum(dim=2) * k_scale
+            scores = logits.sum(dim=2) * k_scale.unsqueeze(1)
         else:
             logits = F.relu(torch.einsum('bthd,bsd->bths', q, k))
             scores = torch.einsum('bths,bth->bts', logits, weights * self.softmax_scale)
@@ -359,8 +359,10 @@ class MultiheadLatentAttention(nn.Module):
             scale = 0.1 * mscale * math.log(rope_factor) + 1.0
             self.softmax_scale *= scale * scale
 
-    def sparse_attention(self, query, key, value, scale, return_weights=False):
+    def sparse_attention(self, query, key, value, scale, attn_mask=None, return_weights=False):
         scores = torch.einsum('bhld,bhlkd->bhlk', query, key) * scale
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
         attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
         # Cast back to value dtype for einsum compatibility
         attn_weights = attn_weights.to(value.dtype)
@@ -444,7 +446,12 @@ class MultiheadLatentAttention(nn.Module):
             query = torch.cat((query_c, query_r), dim=-1)
             key = torch.cat((key_c, key_r), dim=-1)
 
-            attn_o, attn_weights = self.sparse_attention(query, key, value, scale=scale, return_weights=True)
+            positions = torch.arange(seq_len, device=x.device)
+            valid = idx <= positions[None, :, None]
+            attn_mask = valid.unsqueeze(1)
+            attn_o, attn_weights = self.sparse_attention(
+                query, key, value, scale=scale, attn_mask=attn_mask, return_weights=True
+            )
 
         attn_o = attn_o.transpose(1, 2).reshape(batch_size, seq_len, self.n_head * self.d_v)
         out = self.w_out(attn_o)
@@ -458,6 +465,7 @@ class MultiheadLatentAttention(nn.Module):
                 log_q = log_q.masked_fill(~torch.isfinite(index_scores), 0.0)
             else:
                 log_q = F.log_softmax(index_scores.gather(-1, idx), dim=-1)
+                log_q = log_q.masked_fill(~valid, 0.0)
             p = p.detach()
             aux_loss = (p * (p.clamp_min(1e-9).log() - log_q)).sum(dim=-1).mean()
 

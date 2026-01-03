@@ -2,17 +2,17 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    d_model: int = 512
-    n_layers: int = 8
+    d_model: int = 256
+    n_layers: int = 6
     vocab_size: int = 50257  # gpt2 tokenizer
-    hidden_dim: int = 1408
-    n_heads: int = 8
-    max_seq_len: int = 1024
-    d_ckv: int = 256  # kv_lora_rank in MLA
-    d_cq: int = 256   # q_lora_rank in MLA
-    d_head: int = 64  # qk_nope_head_dim in MLA
-    d_v: int = 64     # v_head_dim in MLA (default: same as d_head)
-    d_rope: int = 32  # qk_rope_head_dim in MLA (base dim for PoPE)
+    hidden_dim: int = 768
+    n_heads: int = 4
+    max_seq_len: int = 1024  # model cache length (can be increased for eval)
+    d_ckv: int = 128  # kv_lora_rank in MLA
+    d_cq: int = 128   # q_lora_rank in MLA
+    d_head: int = 32  # qk_nope_head_dim in MLA
+    d_v: int = 32     # v_head_dim in MLA (default: same as d_head)
+    d_rope: int = 16  # qk_rope_head_dim in MLA (base dim for PoPE)
     n_routed: int = 8
     n_shared: int = 1
     top_k: int = 2
@@ -23,13 +23,13 @@ class ModelConfig:
     local_window: int = 0  # 0 disables forced local selection (DeepSeek-V3.2)
     n_indexer_heads: int = 2  # DeepSeek-V3.2 uses small head count for indexer
     d_indexer_head: int = 64
-    indexer_use_fp8: bool = True
+    indexer_use_fp8: bool = False
     indexer_use_hadamard: bool = True
     # Normalization and positional encoding
     rms_eps: float = 1e-6
     rope_base: float = 10000.0
-    original_seq_len: int = 4096
-    rope_factor: float = 40.0
+    original_seq_len: int = 1024  # training context length (YaRN reference)
+    rope_factor: float = 1.0  # YaRN scaling factor (1.0 disables)
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.0
@@ -42,7 +42,8 @@ class TrainConfig:
     max_tokens: int = 1000000000  # 1B tokens for quick baseline
     batch_size: int = 2
     accumulation_steps: int = 16  # Doubled to maintain effective batch size
-    seq_len: int = 1024
+    seq_len: int = 1024  # training context length (align with ModelConfig.original_seq_len)
+    seq_len_final: int | None = None  # optional post-warmup seq len (e.g., 2048)
     grad_clip: float = 1.0
     weight_decay: float = 0.1
     eval_steps: int = 100
