@@ -18,6 +18,7 @@ import numpy as np
 import math
 import time
 import os
+import re
 from model import Cinnamon
 from config import ModelConfig, TrainConfig
 from layers import MoE
@@ -30,6 +31,11 @@ _DROP_BUFFER_SUFFIXES = (".cos_cached", ".sin_cached", ".base_angles")
 
 def _strip_position_buffers(state_dict: dict) -> dict:
     return {k: v for k, v in state_dict.items() if not k.endswith(_DROP_BUFFER_SUFFIXES)}
+
+
+def _sanitize_run_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return safe or "run"
 
 class ShardedDataset(IterableDataset):
     
@@ -118,6 +124,18 @@ class Trainer():
                 name=run_name,
                 config={**asdict(config), **asdict(model_config), "num_params": self.num_params, "max_steps": config.max_steps, "warmup_steps": config.warmup_steps},
             )
+        base_name = run_name
+        if not base_name and self._wandb_run is not None:
+            base_name = self._wandb_run.name or self._wandb_run.id
+        if not base_name:
+            base_name = time.strftime("run-%Y%m%d-%H%M%S")
+        safe_name = _sanitize_run_name(base_name)
+        self.checkpoint_dir = CHECKPOINT_DIR / safe_name
+        if self.rank == 0:
+            if self.checkpoint_dir.exists():
+                suffix = time.strftime("%Y%m%d-%H%M%S")
+                self.checkpoint_dir = CHECKPOINT_DIR / f"{safe_name}-{suffix}"
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def set_seed(self, seed):
       random.seed(seed)
@@ -394,8 +412,8 @@ class Trainer():
                                 "tokens_seen": self.tokens_seen,
                                 "config": self.config,
                                 "ema_loss": ema_loss
-                            }, CHECKPOINT_DIR / f"checkpoint_{self.step}.pt")
-                            print(f"saved checkpoint to {CHECKPOINT_DIR / f'checkpoint_{self.step}.pt'}")
+                            }, self.checkpoint_dir / f"checkpoint_{self.step}.pt")
+                            print(f"saved checkpoint to {self.checkpoint_dir / f'checkpoint_{self.step}.pt'}")
                     if self.step >= self.config.max_steps:
                         break
         if self.rank == 0:

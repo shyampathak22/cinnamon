@@ -11,7 +11,7 @@ import tiktoken
 from tqdm import tqdm
 import wandb
 
-from config import ModelConfig
+from config import ModelConfig, TrainConfig
 from model import Cinnamon
 
 
@@ -85,6 +85,44 @@ def _parse_lengths(arg: str | None) -> list[int] | None:
 
 def _strip_position_buffers(state_dict: dict) -> dict:
     return {k: v for k, v in state_dict.items() if not k.endswith(_DROP_BUFFER_SUFFIXES)}
+
+
+def _normalize_state_dict_keys(state_dict: dict) -> dict:
+    prefixes = ("_orig_mod.", "module.")
+    normalized = {}
+    for key, value in state_dict.items():
+        new_key = key
+        stripped = True
+        while stripped:
+            stripped = False
+            for prefix in prefixes:
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix):]
+                    stripped = True
+                    break
+        normalized[new_key] = value
+    return normalized
+
+
+def _load_checkpoint(path: Path):
+    load_kwargs = {"map_location": "cpu"}
+    try:
+        return torch.load(path, **load_kwargs)
+    except Exception as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+    try:
+        from torch.serialization import safe_globals
+    except Exception:
+        safe_globals = None
+    if safe_globals is not None:
+        try:
+            with safe_globals([TrainConfig, ModelConfig]):
+                return torch.load(path, **load_kwargs, weights_only=True)
+        except Exception:
+            pass
+    print("Falling back to weights_only=False for checkpoint load.")
+    return torch.load(path, **load_kwargs, weights_only=False)
 
 
 def _normalize_context(example: dict) -> str:
@@ -273,9 +311,9 @@ def main():
         cfg.beta_slow, cfg.mscale, cfg.indexer_use_fp8, cfg.indexer_use_hadamard
     )
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = _load_checkpoint(args.checkpoint)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-    state_dict = _strip_position_buffers(state_dict)
+    state_dict = _normalize_state_dict_keys(_strip_position_buffers(state_dict))
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing = [k for k in incompatible.missing_keys if not k.endswith(_DROP_BUFFER_SUFFIXES)]
     unexpected = [k for k in incompatible.unexpected_keys if not k.endswith(_DROP_BUFFER_SUFFIXES)]
