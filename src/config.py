@@ -34,7 +34,7 @@ class ModelConfig:
     beta_slow: int = 1
     mscale: float = 1.0
     rope_type: str = 'rope'  # 'rope' (standard RoPE) or 'pope' (Polar PE)
-    pope_delta_init: str = "zero"  # "zero" or "uniform"
+    pope_delta_init: str = "uniform"  # "zero" or "uniform"
 
 @dataclass
 class TrainConfig:
