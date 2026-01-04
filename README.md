@@ -6,13 +6,11 @@ NOTE: This is a WIP, I'm currently training/testing the following:
 
 1. Evaluations of RoPE vs PoPE (currently running)
 2. Currently debugging an mHC implementation (kernel issues) - Planning to run and ablate this weekend.
-3. A weird combination of mHC and DDL (early math says maybe a good idea? I could be incorrect(
-4. Debugging fp8 kernels (facing NaN loss issues due to training stability with small models)
+4. Debugging fp8 kernels for small model sizes (facing NaN loss issues due to training stability with small models)
 
 So far, I've only been able to attempt training models with less than 30M params at a max of 250M tokens, not nearly enough to see emergent behaviors from the some of the architectural implementations. I would like to train larger models for much longer, of course, but I am limited by my constrained hardware (2x 5060 Ti GPUs). While they have ample memory (32GB between the cards) for the size and batches, the bottleneck becomes the speed of compute. 
 
 Further note: fp8 kernels will NOT work on all GPUs. Please refer to your CUDA compute capability to see if you can run the fp8 training. Otherwise, you can run the scripts with the --disable-fp8 flag, and the model will default to bf16.
-
 
 Also, PLEASE RIP THIS APART! im actively learning, and I need peers to poke holes in my implementations! I welcome any and all criticisms!
 
@@ -191,4 +189,5 @@ cinnamon/
 │   ├── test_benchmarks.py
 │   └── test_norm.py
 └── pyproject.toml
+
 
