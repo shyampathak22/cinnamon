@@ -8,7 +8,7 @@ NOTE: This is a WIP, I'm currently training/testing the following:
 2. Currently debugging an mHC implementation (kernel issues) - Planning to run and ablate this weekend.
 4. Debugging fp8 kernels for small model sizes (facing NaN loss issues due to training stability with small models)
 
-So far, I've only been able to attempt training models with less than 30M params at a max of 250M tokens, not nearly enough to see emergent behaviors from the some of the architectural implementations. I would like to train larger models for much longer, of course, but I am limited by my constrained hardware (2x 5060 Ti GPUs). While they have ample memory (32GB between the cards) for the size and batches, the bottleneck becomes the speed of compute. 
+So far, I've only been able to attempt training models with less than 30M params at a max of 250M tokens, not nearly enough to see emergent behaviors from the some of the architectural implementations. I would like to train larger models for much longer, of course, but I am limited by my constrained hardware (2x 5060 Ti GPUs). While they have ample memory (32GB between the cards) for the size and batches, the bottleneck becomes the speed of compute.
 
 Further note: fp8 kernels will NOT work on all GPUs. Please refer to your CUDA compute capability to see if you can run the fp8 training. Otherwise, you can run the scripts with the --disable-fp8 flag, and the model will default to bf16.
 
@@ -66,128 +66,34 @@ uv sync --dev
 ### Training
 
 ```bash
-# Train with RoPE (default)
-uv run python src/train.py
+# Train with RoPE
+./scripts/launch_train_rope.sh
 
 # Train with PoPE
-uv run python src/train.py --rope-type pope
+./scripts/launch_train_pope.sh
 
-# Key training flags
-uv run python src/train.py \
-    --lr 3e-4 \
-    --batch-size 2 \
-    --accumulation-steps 16 \
-    --seq-len 1024 \
-    --max-tokens 1000000000 \
-    --rope-type rope \
-    --dsa-warmup-steps 1000
+# Train with RoPE + YaRN (for length extrapolation)
+./scripts/launch_train_rope_yarn.sh
+
+# Disable FP8 if your GPU doesn't support it
+./scripts/launch_train_rope.sh --disable-fp8
+```
+
+### Evaluation
+
+```bash
+# Evaluate checkpoints on length extrapolation
+uv run python src/eval.py artifacts/checkpoints/*/checkpoint_*.pt --lengths 512,1024,2048,4096
 ```
 
 ### Testing
 
 ```bash
-# Run all tests
 uv run pytest
-
-# Run specific test modules
-uv run pytest tests/test_attention.py -v
-
-# Run benchmarks (with output)
-uv run pytest -m benchmark -v -s
-
-# Skip slow tests
-uv run pytest -m "not slow"
 ```
-
-## Architecture
-
-```
-Cinnamon
-├── Embedding (shared with lm_head)
-├── Transformer Blocks × n_layers
-│   ├── RMSNorm
-│   ├── Multi-head Latent Attention
-│   │   ├── KV Compression (W_dkv → kv_norm → W_uk, W_uv)
-│   │   ├── Q Compression (W_dq → q_norm → W_uq)
-│   │   ├── Position Encoding (RoPE or PoPE)
-│   │   ├── DSA Indexer (Lightning Indexer)
-│   │   └── Sparse Attention
-│   ├── RMSNorm
-│   └── MoE
-│       ├── Router (sigmoid gating)
-│       ├── Shared Experts
-│       └── Routed Experts (top-k selection)
-├── RMSNorm
-├── LM Head
-└── MTP Modules × mtp_depth
-    ├── Norm + Concat + Project
-    └── Transformer Block
-```
-
-## Configuration
-
-### Model Config (`src/config.py`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `d_model` | 512 | Model dimension |
-| `n_layers` | 8 | Number of transformer layers |
-| `n_heads` | 8 | Number of attention heads |
-| `d_ckv` | 256 | KV compression dimension |
-| `d_cq` | 256 | Q compression dimension |
-| `d_head` | 64 | Attention head dimension |
-| `d_v` | 64 | Value head dimension |
-| `d_rope` | 32 | RoPE/PoPE dimension |
-| `n_routed` | 8 | Number of routed experts |
-| `n_shared` | 1 | Number of shared experts |
-| `top_k` | 2 | Experts per token |
-| `dsa_topk` | 64 | Tokens selected by DSA |
-| `local_window` | 0 | Forced local attention window |
-| `mtp_depth` | 1 | Multi-token prediction depth |
-| `rope_type` | 'rope' | Position encoding ('rope' or 'pope') |
-
-### Training Config
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `lr` | 3e-4 | Learning rate |
-| `max_tokens` | 1B | Total training tokens |
-| `batch_size` | 2 | Batch size per step |
-| `accumulation_steps` | 16 | Gradient accumulation |
-| `seq_len` | 1024 | Sequence length |
-| `mtp_lambda` | 0.3 | MTP loss weight (decays to 0.1) |
-| `dsa_kl_weight` | 1.0 | DSA KL divergence loss weight |
-| `dsa_warmup_steps` | 0 | Dense attention warmup steps |
-| `moe_balance_alpha` | 1e-2 | MoE balance loss weight |
-| `use_fp8` | True | Enable FP8 training |
 
 ## References
 
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) - Base architecture (MLA, MoE, MTP)
 - [DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models](https://arxiv.org/abs/2512.02556) - DeepSeek Sparse Attention (DSA), Lightning Indexer
 - [Decoupling the 'What' and 'Where' With Polar Coordinate Positional Embeddings](https://arxiv.org/abs/2509.10534) - PoPE
-
-## Project Structure
-
-```
-cinnamon/
-├── src/
-│   ├── attention.py    # RoPE, PoPE, DSAIndexer, MLA
-│   ├── layers.py       # Transformer, MoE, MTPModule
-│   ├── model.py        # Cinnamon model
-│   ├── config.py       # Model and training configs
-│   ├── kernels.py      # FP8 quantization, Triton kernels
-│   ├── norm.py         # RMSNorm
-│   ├── train.py        # Training loop
-│   └── preprocess.py   # Data preprocessing
-├── tests/
-│   ├── conftest.py     # Shared fixtures
-│   ├── test_attention.py
-│   ├── test_layers.py
-│   ├── test_model.py
-│   ├── test_kernels.py
-│   ├── test_benchmarks.py
-│   └── test_norm.py
-└── pyproject.toml
-
-
