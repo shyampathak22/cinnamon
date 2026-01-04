@@ -107,23 +107,24 @@ Trained for 250M tokens with d_rope=64, seq_len 512→1024, evaluated on held-ou
 
 ![RoPE vs PoPE Length Extrapolation](plots/length_extrapolation.png)
 
-| Sequence Length | RoPE (ppl) | PoPE (ppl) | Winner |
-|-----------------|------------|------------|--------|
-| 512 (train) | **125.51** | 126.36 | RoPE |
-| 1024 (train) | **117.77** | 119.13 | RoPE |
-| 2048 (2x) | 192.22 | **130.85** | PoPE |
-| 4096 (4x) | 281.44 | **140.55** | PoPE |
-| 8192 (8x) | 378.78 | **167.95** | PoPE |
+| Sequence Length | RoPE (ppl) | PoPE (ppl) |
+|-----------------|------------|------------|
+| 512 (train) | **125.51** | 128.96 |
+| 1024 (train) | **117.77** | 120.66 |
+| 2048 (2x) | 192.22 | **128.70** |
+| 4096 (4x) | 281.44 | **124.79** |
+| 8192 (8x) | 378.78 | **122.01** |
 
 **Key findings:**
 - At training lengths, RoPE and PoPE perform similarly
 - At extrapolation lengths, PoPE significantly outperforms RoPE
-- **Degradation (1024 → 8192):** RoPE 3.22x vs PoPE 1.41x
-- PoPE maintains much more stable perplexity as context length increases
+- **Degradation (1024 → 8192):** RoPE 3.22x vs PoPE 1.01x
+- PoPE **IMPROVES** at further context lengths. I believe this is due to the combination of it with DSA, creating a highly selective and relevant attention mechanism.
 
 ## References
 
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) - Base architecture (MLA, MoE, MTP)
 - [DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models](https://arxiv.org/abs/2512.02556) - DeepSeek Sparse Attention (DSA), Lightning Indexer
 - [Decoupling the 'What' and 'Where' With Polar Coordinate Positional Embeddings](https://arxiv.org/abs/2509.10534) - PoPE
+
 
