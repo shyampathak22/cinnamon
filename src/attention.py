@@ -217,10 +217,11 @@ class DSAIndexer(nn.Module):
     """
     def __init__(self, d_model, d_cq, n_heads, d_head, d_rope, max_seq_len, rope_base, rope_type,
                  topk, use_fp8=True, use_hadamard=True, original_seq_len=None, rope_factor=1.0,
-                 beta_fast=32, beta_slow=1):
+                 beta_fast=32, beta_slow=1, pope_delta_init='zero'):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_head
+        self.d_rope = d_rope
         self.topk = topk
         self.use_fp8 = use_fp8
         self.use_hadamard = use_hadamard
@@ -232,16 +233,21 @@ class DSAIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(d_head)
         self.weights_proj = nn.Linear(d_model, n_heads, bias=False)
 
-        # Indexer positional encoding (RoPE per DSA paper)
-        self.rope = RoPE(
-            d_rope,
-            max_seq_len=max_seq_len,
-            base=rope_base,
-            original_seq_len=original_seq_len,
-            rope_factor=rope_factor,
-            beta_fast=beta_fast,
-            beta_slow=beta_slow,
-        )
+        # Indexer positional encoding - matches main attention's rope_type
+        if rope_type == 'pope':
+            self.pos_enc = PoPE(d_rope, max_seq_len, rope_base, delta_init=pope_delta_init)
+            self.pos_enc_dim = d_rope * 2  # PoPE outputs cos + sin
+        else:
+            self.pos_enc = RoPE(
+                d_rope,
+                max_seq_len=max_seq_len,
+                base=rope_base,
+                original_seq_len=original_seq_len,
+                rope_factor=rope_factor,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+            )
+            self.pos_enc_dim = d_rope  # RoPE preserves dimension
 
         try:
             from kernels import quantize_fp8_rowwise
@@ -249,22 +255,26 @@ class DSAIndexer(nn.Module):
         except Exception:
             self._quantize_fp8_rowwise = None
 
-    def _apply_indexer_rope(self, x, positions=None):
-        # DSA uses non-interleaved RoPE in the indexer.
-        return self.rope(x, positions=positions, interleaved=False)
+    def _apply_pos_enc(self, x, positions=None, apply_delta=False):
+        """Apply positional encoding (RoPE or PoPE) to indexer queries/keys."""
+        if self.rope_type == 'pope':
+            return self.pos_enc(x, apply_delta=apply_delta, positions=positions)
+        else:
+            return self.pos_enc(x, positions=positions, interleaved=False)
 
     def forward(self, x, q_latent, positions=None, mask=None, return_scores=False):
         bsz, seqlen, _ = x.shape
         q = self.w_q(q_latent).view(bsz, seqlen, self.n_heads, self.d_head)
         k = self.k_norm(self.w_k(x))
 
-        # Apply partial RoPE to indexer queries/keys
-        rope_dim = min(self.rope.d_k, self.d_head)
+        # Apply positional encoding to indexer queries/keys
+        rope_dim = min(self.d_rope, self.d_head)
         if rope_dim > 0:
             q_rope, q_nope = q[..., :rope_dim], q[..., rope_dim:]
             k_rope, k_nope = k[..., :rope_dim], k[..., rope_dim:]
-            q_rope = self._apply_indexer_rope(q_rope, positions=None)
-            k_rope = self._apply_indexer_rope(k_rope.unsqueeze(2), positions=None).squeeze(2)
+            # For PoPE: queries don't get delta, keys do
+            q_rope = self._apply_pos_enc(q_rope, positions=None, apply_delta=False)
+            k_rope = self._apply_pos_enc(k_rope.unsqueeze(2), positions=None, apply_delta=True).squeeze(2)
             q = torch.cat([q_rope, q_nope], dim=-1)
             k = torch.cat([k_rope, k_nope], dim=-1)
 
@@ -352,7 +362,8 @@ class MultiheadLatentAttention(nn.Module):
             d_model, d_cq, n_indexer_heads, d_indexer_head, d_rope, max_seq_len,
             rope_base, rope_type, dsa_topk, use_fp8=indexer_use_fp8,
             use_hadamard=indexer_use_hadamard, original_seq_len=self.original_seq_len,
-            rope_factor=rope_factor, beta_fast=beta_fast, beta_slow=beta_slow
+            rope_factor=rope_factor, beta_fast=beta_fast, beta_slow=beta_slow,
+            pope_delta_init=pope_delta_init
         )
         self.softmax_scale = (self.d_head + self.rope_dim) ** -0.5
         if rope_type == 'rope' and max_seq_len > self.original_seq_len and rope_factor != 1.0:
