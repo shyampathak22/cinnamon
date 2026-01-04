@@ -10,7 +10,12 @@ NOTE: This is a WIP, I'm currently training/testing the following:
 
 So far, I've only been able to attempt training models with less than 30M params at a max of 250M tokens, not nearly enough to see emergent behaviors from the some of the architectural implementations. I would like to train larger models for much longer, of course, but I am limited by my constrained hardware (2x 5060 Ti GPUs). While they have ample memory (32GB between the cards) for the size and batches, the bottleneck becomes the speed of compute.
 
-Further note: fp8 kernels will NOT work on all GPUs. Please refer to your CUDA compute capability to see if you can run the fp8 training. Otherwise, you can run the scripts with the --disable-fp8 flag, and the model will default to bf16.
+Further notes: 
+- fp8 kernels will NOT work on all GPUs. Please refer to your CUDA compute capability to see if you can run the fp8 training. Otherwise, you can run the scripts with the --disable-fp8 flag, and the model will default to bf16.
+- MTP Lambda and MoE Gamma values are set to switch at 67.6% and 96.6% of training, respectively.
+- d_rope is used for both PoPE and RoPE dimension configs
+- original_seq_len in configs is a YaRN reference. I have not tested the YaRN configurations yet, there could be bugs.
+- Some config settings are overridden in the launch scripts for training to allow for a single launch of all 3 train modes.
 
 Also, PLEASE RIP THIS APART! im actively learning, and I need peers to poke holes in my implementations! I welcome any and all criticisms!
 
