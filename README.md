@@ -103,8 +103,6 @@ uv run pytest
 
 Trained for 250M tokens with d_rope=64, seq_len 512→1024, evaluated on held-out validation data.
 
-> **Note:** The DSA Lightning Indexer was mistakenly trained with RoPE even when rope_type=pope. This means the token selection for sparse attention used RoPE-based patterns, potentially limiting PoPE's effectiveness. These results are not fully representative of PoPE's capacity.
-
 ![RoPE vs PoPE Length Extrapolation](plots/pope_vs_rope_extrapolation.png)
 
 | Sequence Length | RoPE (ppl) | PoPE (ppl) |
@@ -126,6 +124,7 @@ Trained for 250M tokens with d_rope=64, seq_len 512→1024, evaluated on held-ou
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) - Base architecture (MLA, MoE, MTP)
 - [DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models](https://arxiv.org/abs/2512.02556) - DeepSeek Sparse Attention (DSA), Lightning Indexer
 - [Decoupling the 'What' and 'Where' With Polar Coordinate Positional Embeddings](https://arxiv.org/abs/2509.10534) - PoPE
+
 
 
 
