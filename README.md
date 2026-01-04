@@ -97,6 +97,30 @@ uv run python src/eval.py artifacts/checkpoints/*/checkpoint_*.pt --lengths 512,
 uv run pytest
 ```
 
+## Evaluation Results
+
+### PoPE vs RoPE Length Extrapolation
+
+Trained for 250M tokens with d_rope=64, seq_len 512→1024, evaluated on held-out validation data.
+
+> **Note:** The DSA Lightning Indexer was mistakenly trained with RoPE even when rope_type=pope. This means the token selection for sparse attention used RoPE-based patterns, potentially limiting PoPE's effectiveness. These results are not fully representative of PoPE's capacity.
+
+![RoPE vs PoPE Length Extrapolation](plots/rope_vs_pope_extrapolation.png)
+
+| Sequence Length | RoPE (ppl) | PoPE (ppl) | Winner |
+|-----------------|------------|------------|--------|
+| 512 (train) | **125.51** | 126.36 | RoPE |
+| 1024 (train) | **117.77** | 119.13 | RoPE |
+| 2048 (2x) | 192.22 | **130.85** | PoPE |
+| 4096 (4x) | 281.44 | **140.55** | PoPE |
+| 8192 (8x) | 378.78 | **167.95** | PoPE |
+
+**Key findings:**
+- At training lengths, RoPE and PoPE perform similarly
+- At extrapolation lengths, PoPE significantly outperforms RoPE
+- **Degradation (1024 → 8192):** RoPE 3.22x vs PoPE 1.41x
+- PoPE maintains much more stable perplexity as context length increases
+
 ## References
 
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) - Base architecture (MLA, MoE, MTP)

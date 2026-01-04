@@ -31,6 +31,7 @@ packages = ["src/cinnamon"]
 dev-dependencies = [
     "pytest",
     "ipython",
+    "matplotlib>=3.10.8",
 ]
 
 [tool.pytest.ini_options]
