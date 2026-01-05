@@ -210,6 +210,7 @@ def quantize_fp8_rowwise(
         x_fp8.stride(0), x_fp8.stride(1),
         BLOCK_SIZE=block_size,
         ROUND_SCALE=round_scale,
+        FP8_MAX=448.0,  # Must pass explicitly for torch.compile compatibility
     )
 
     return x_fp8, scales
@@ -252,6 +253,7 @@ def quantize_fp8_blockwise(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         ROUND_SCALE=round_scale,
+        FP8_MAX=448.0,  # Must pass explicitly for torch.compile compatibility
     )
 
     return x_fp8, scales
@@ -851,14 +853,18 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
     Returns:
         Model with FP8Linear layers (except excluded)
     """
-    # Default exclusions per DeepSeek V3.2 recommendations
+    # Default exclusions per DeepSeek V3 paper Section 3.3.1
+    # "we maintain the original precision (BF16/FP32) for: the embedding module,
+    # the output head, MoE gating modules, normalization operators, and attention operators"
     default_exclude = [
-        'embedding',
-        'lm_head',
-        'router',       # MoE gating must stay high precision
-        'norm',         # RMSNorm
-        'indexer',      # DSA indexer stays high precision for stability
+        'embedding',    # Embedding module
+        'lm_head',      # Output head
+        'router',       # MoE gating modules
+        'norm',         # Normalization operators (RMSNorm)
+        'attn',         # ALL attention operators (w_dkv, w_uk, w_uv, w_dq, w_uq, w_qr, w_kr, w_out)
+        'indexer',      # DSA indexer (implicit in attn, but explicit for safety)
     ]
+    # FP8 is ONLY applied to MoE FFN layers: shared experts (w1, w2, w3) and routed experts
 
     exclude_names = (exclude_names or []) + default_exclude
     round_scale_names = [
@@ -871,6 +877,11 @@ def convert_to_fp8(model: torch.nn.Module, exclude_names: list = None) -> torch.
         if isinstance(module, torch.nn.Linear):
             # Check if this layer should be excluded
             if any(excl in name for excl in exclude_names):
+                continue
+
+            # Auto-exclude layers with dimensions < 128 (FP8 block size)
+            if module.in_features < 128 or module.out_features < 128:
+                print(f"[FP8] Auto-excluding {name}: shape ({module.out_features}, {module.in_features}) < 128")
                 continue
 
             # Get parent module and attribute name
