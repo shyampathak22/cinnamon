@@ -12,6 +12,7 @@ dependencies = [
     "tqdm",
     "wandb",
     "datasets>=4.4.2",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]

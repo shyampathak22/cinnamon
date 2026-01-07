@@ -20,6 +20,8 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import tiktoken
+import matplotlib.pyplot as plt
+import matplotlib
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -55,10 +57,65 @@ def infer_config(checkpoint_path: Path) -> dict:
 
 
 def load_model(checkpoint_path: Path, max_seq_len: int, device: torch.device) -> torch.nn.Module:
-    """Load model from checkpoint with proper config."""
+    """Load model from checkpoint with proper config, inferring dimensions from checkpoint."""
     config = infer_config(checkpoint_path)
 
+    # Load checkpoint first to infer dimensions
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+
+    # Normalize keys
+    normalized = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("_orig_mod.", "").replace("module.", "")
+        if not new_k.endswith(_DROP_BUFFER_SUFFIXES):
+            normalized[new_k] = v
+
+    # Infer dimensions from checkpoint
+    d_model = normalized["embedding.weight"].shape[1]
+    n_layers = sum(1 for k in normalized if k.startswith("transformer_layers.") and k.endswith(".rms1.gamma"))
+
+    # Infer other dimensions from weights
+    d_ckv = normalized["transformer_layers.0.attn.w_dkv.weight"].shape[0]
+    d_cq = normalized["transformer_layers.0.attn.w_dq.weight"].shape[0]
+    hidden_dim = normalized["transformer_layers.0.moe.shared_experts.0.w1.weight"].shape[0]
+    n_routed = normalized["transformer_layers.0.moe.routed_experts.w12"].shape[0]
+    n_indexer_heads = normalized["transformer_layers.0.attn.indexer.weights_proj.weight"].shape[0]
+
+    # Infer attention head dimensions
+    # w_uk has shape [d_head * n_heads, d_ckv]
+    w_uk_shape = normalized["transformer_layers.0.attn.w_uk.weight"].shape
+    d_head_times_n_heads = w_uk_shape[0]
+
+    # w_out has shape [d_model, d_v * n_heads]
+    w_out_shape = normalized["transformer_layers.0.attn.w_out.weight"].shape
+    d_v_times_n_heads = w_out_shape[1]
+
+    # w_qr has shape [d_rope * n_heads, d_cq]
+    w_qr_shape = normalized["transformer_layers.0.attn.w_qr.weight"].shape
+    d_rope_times_n_heads = w_qr_shape[0]
+
+    # Assume d_rope=64 is standard, infer n_heads
+    d_rope = 64
+    n_heads = d_rope_times_n_heads // d_rope
+    d_head = d_head_times_n_heads // n_heads
+    d_v = d_v_times_n_heads // n_heads
+
+    print(f"  Inferred config: d_model={d_model}, n_layers={n_layers}, hidden_dim={hidden_dim}")
+    print(f"  d_ckv={d_ckv}, d_cq={d_cq}, n_heads={n_heads}, d_head={d_head}, d_v={d_v}, n_indexer_heads={n_indexer_heads}")
+
     cfg = ModelConfig()
+    cfg.d_model = d_model
+    cfg.n_layers = n_layers
+    cfg.hidden_dim = hidden_dim
+    cfg.d_ckv = d_ckv
+    cfg.d_cq = d_cq
+    cfg.n_heads = n_heads
+    cfg.d_head = d_head
+    cfg.d_v = d_v
+    cfg.d_rope = d_rope
+    cfg.n_routed = n_routed
+    cfg.n_indexer_heads = n_indexer_heads
     cfg.max_seq_len = max_seq_len
     cfg.original_seq_len = ORIGINAL_SEQ_LEN
     cfg.rope_type = config["rope_type"]
@@ -72,17 +129,6 @@ def load_model(checkpoint_path: Path, max_seq_len: int, device: torch.device) ->
         cfg.mtp_depth, cfg.pope_delta_init, cfg.original_seq_len, cfg.rope_factor, cfg.beta_fast,
         cfg.beta_slow, cfg.mscale, cfg.indexer_use_fp8, cfg.indexer_use_hadamard
     )
-
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-
-    # Normalize keys and strip buffers
-    normalized = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("_orig_mod.", "").replace("module.", "")
-        if not new_k.endswith(_DROP_BUFFER_SUFFIXES):
-            normalized[new_k] = v
 
     model.load_state_dict(normalized, strict=False)
     model.to(device)
@@ -234,6 +280,96 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(all_results, indent=2))
         print(f"\nSaved to {args.output}")
+
+    # Generate plot
+    if len(all_results) >= 1:
+        plot_path = Path("plots") / "length_extrapolation_eval.png"
+        plot_results(all_results, lengths, plot_path)
+
+
+def plot_results(all_results: list, lengths: list, output_path: Path):
+    """Generate comparison plot of perplexity vs sequence length."""
+    matplotlib.use('Agg')
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    colors = {'rope': '#e74c3c', 'pope': '#2ecc71', 'rope-yarn': '#3498db'}
+    markers = {'rope': 'o', 'pope': 's', 'rope-yarn': '^'}
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left plot: Raw perplexity
+    for result in all_results:
+        name = result['name']
+        config_type = result['config']['rope_type']
+        if 'yarn' in name.lower():
+            config_type = 'rope-yarn'
+        elif 'pope' in name.lower():
+            config_type = 'pope'
+        else:
+            config_type = 'rope'
+
+        ppls = [r['perplexity'] for r in result['results']]
+        color = colors.get(config_type, 'gray')
+        marker = markers.get(config_type, 'o')
+        label = config_type.upper()
+
+        ax1.plot(lengths, ppls, color=color, marker=marker, linewidth=2,
+                markersize=8, label=label)
+        ax1.annotate(f'{ppls[-1]:.0f}', (lengths[-1], ppls[-1]),
+                    textcoords="offset points", xytext=(5, 0), fontsize=10, color=color)
+
+    ax1.axvline(x=TRAINING_SEQ_LEN, color='gray', linestyle='--', alpha=0.7, label='Training Length')
+    ax1.axvspan(TRAINING_SEQ_LEN, max(lengths), alpha=0.1, color='orange')
+    ax1.text(TRAINING_SEQ_LEN * 1.1, ax1.get_ylim()[1] * 0.95, 'Extrapolation', fontsize=9, color='gray')
+
+    ax1.set_xlabel('Sequence Length', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Perplexity', fontsize=12, fontweight='bold')
+    ax1.set_title('Length Extrapolation: RoPE vs PoPE', fontsize=14, fontweight='bold')
+    ax1.set_xscale('log', base=2)
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+
+    # Right plot: Degradation ratio
+    train_idx = lengths.index(TRAINING_SEQ_LEN) if TRAINING_SEQ_LEN in lengths else 0
+
+    for result in all_results:
+        name = result['name']
+        config_type = result['config']['rope_type']
+        if 'yarn' in name.lower():
+            config_type = 'rope-yarn'
+        elif 'pope' in name.lower():
+            config_type = 'pope'
+        else:
+            config_type = 'rope'
+
+        ppls = [r['perplexity'] for r in result['results']]
+        base_ppl = ppls[train_idx]
+        ratios = [p / base_ppl for p in ppls]
+
+        color = colors.get(config_type, 'gray')
+        marker = markers.get(config_type, 'o')
+        label = config_type.upper()
+
+        ax2.plot(lengths, ratios, color=color, marker=marker, linewidth=2,
+                markersize=8, label=label)
+        ax2.annotate(f'{ratios[-1]:.2f}x', (lengths[-1], ratios[-1]),
+                    textcoords="offset points", xytext=(5, 0), fontsize=10, color=color)
+
+    ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7, label='No degradation')
+    ax2.axvline(x=TRAINING_SEQ_LEN, color='gray', linestyle='--', alpha=0.5)
+
+    ax2.set_xlabel('Sequence Length', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Perplexity Ratio (vs Training Length)', fontsize=12, fontweight='bold')
+    ax2.set_title('Extrapolation Degradation Factor\n(1.0 = no degradation)', fontsize=14, fontweight='bold')
+    ax2.set_xscale('log', base=2)
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"\nSaved plot to {output_path}")
 
 
 if __name__ == "__main__":

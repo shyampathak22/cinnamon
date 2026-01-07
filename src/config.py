@@ -2,26 +2,27 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    d_model: int = 256
-    n_layers: int = 6
+    # ~202.6M params (scaled from 27M baseline for 10B token training)
+    d_model: int = 512
+    n_layers: int = 20
     vocab_size: int = 50257  # gpt2 tokenizer
-    hidden_dim: int = 768
-    n_heads: int = 4
+    hidden_dim: int = 1536   # ~3x d_model (DeepSeek ratio)
+    n_heads: int = 8
     max_seq_len: int = 1024  # model cache length (can be increased for eval)
-    d_ckv: int = 128  # kv_lora_rank in MLA
-    d_cq: int = 128   # q_lora_rank in MLA
-    d_head: int = 32  # qk_nope_head_dim in MLA
-    d_v: int = 32     # v_head_dim in MLA (default: same as d_head)
-    d_rope: int = 64  # qk_rope_head_dim in MLA (base dim for PoPE)
+    d_ckv: int = 256   # kv_lora_rank in MLA (scaled 2x)
+    d_cq: int = 256    # q_lora_rank in MLA (scaled 2x)
+    d_head: int = 64   # qk_nope_head_dim in MLA (scaled 2x)
+    d_v: int = 64      # v_head_dim in MLA (scaled 2x)
+    d_rope: int = 64   # qk_rope_head_dim in MLA (PoPE doubles this internally)
     n_routed: int = 8
     n_shared: int = 1
     top_k: int = 2
     expert_scale: int = 4
-    gamma: float = 0.001
+    gamma: float = 0.001  # DeepSeek V3 bias update speed
     mtp_depth: int = 1
-    dsa_topk: int = 64  # tokens selected by DSA
+    dsa_topk: int = 128   # tokens selected by DSA (~12.5% at 1024 context)
     local_window: int = 0  # 0 disables forced local selection (DeepSeek-V3.2)
-    n_indexer_heads: int = 2  # DeepSeek-V3.2 uses small head count for indexer
+    n_indexer_heads: int = 4  # scaled for larger model
     d_indexer_head: int = 64
     indexer_use_fp8: bool = False
     indexer_use_hadamard: bool = True
@@ -33,33 +34,38 @@ class ModelConfig:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.0
-    rope_type: str = 'rope'  # 'rope' (standard RoPE) or 'pope' (Polar PE)
+    rope_type: str = 'pope'  # 'rope' (standard RoPE) or 'pope' (Polar PE)
     pope_delta_init: str = "zero"  # "zero" or "uniform"
+    use_sparse_kernel: bool = True  # TRUE sparse attention kernel (O(L*K) vs O(L^2))
 
 @dataclass
 class TrainConfig:
-    lr: float = 6e-4
-    max_tokens: int = 1000000000  # 1B tokens for quick baseline
+    # Scaled for 10B tokens, ~200M params (DeepSeek V3 ratios)
+    lr: float = 3e-4  # restored after adding RoPE projection norms
+    max_tokens: int = 10_000_000_000  # 10B tokens
     batch_size: int = 2
-    accumulation_steps: int = 16  # Doubled to maintain effective batch size
-    seq_len: int = 1024  # training context length (align with ModelConfig.original_seq_len)
-    seq_len_final: int | None = None  # optional post-warmup seq len (e.g., 2048)
-    grad_clip: float = 1.0
-    weight_decay: float = 0.1
-    eval_steps: int = 100
-    log_steps: int = 5
-    checkpoint_steps: int = 500
-    seed: int = 42  # TIL this is a reference from the hitchhiker's guide to the galaxy!
+    accumulation_steps: int = 32  # effective batch = 2*32*1024 = 65k tokens/step
+    seq_len: int = 1024  # training context length (align with ModelConfig)
+    seq_len_final: int | None = None  # optional post-warmup seq len
+    grad_clip: float = 1.0  # DeepSeek V3: 1.0
+    weight_decay: float = 0.1  # DeepSeek V3: 0.1
+    eval_steps: int = 200
+    log_steps: int = 10
+    checkpoint_steps: int = 1000
+    seed: int = 42
     peak_flops: float = 23.7e12
+    # MTP schedule: λ=0.3→0.1 at 67.6% (DeepSeek V3: 10T/14.8T)
     mtp_lambda: float = 0.3
     mtp_lambda_final: float = 0.1
-    mtp_lambda_switch_tokens: int = 33_800_000
+    mtp_lambda_switch_tokens: int = 6_760_000_000  # 67.6% of 10B
     dsa_kl_weight: float = 1.0
     dsa_warmup_steps: int = 0
     dsa_warmup_lr: float = 1e-3
-    moe_balance_alpha: float = 1e-2
+    # Balance loss: DeepSeek V3 uses α=0.0001 (NOT 0.01!)
+    moe_balance_alpha: float = 1e-4
+    # Gamma schedule: γ=0.001→0.0 at 96.6% (DeepSeek V3: 14.3T/14.8T)
     gamma_final: float = 0.0
-    gamma_switch_tokens: int = 48_300_000
+    gamma_switch_tokens: int = 9_660_000_000  # 96.6% of 10B
     # DataLoader settings
     num_workers: int = 4
     pin_memory: bool = True

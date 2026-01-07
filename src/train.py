@@ -1,6 +1,7 @@
 import torch
 import torch.nn
 import torch.nn.functional as F
+import contextlib
 import logging
 
 # Silence spammy torch.compile warnings
@@ -27,6 +28,97 @@ from dataclasses import asdict
 DATA_DIR = Path(__file__).parent.parent / "artifacts" / "tokenized_data"
 CHECKPOINT_DIR = Path(__file__).parent.parent / "artifacts" / "checkpoints"
 _DROP_BUFFER_SUFFIXES = (".cos_cached", ".sin_cached", ".base_angles")
+
+
+def compute_flops_per_token(model_cfg, train_cfg, dsa_warmup=False):
+    """
+    Compute FLOPs per token for Cinnamon (MLA + MoE) architecture.
+
+    Based on: https://arxiv.org/abs/2001.08361 (Scaling Laws)
+    FLOP = 2 * params for matmul (multiply-accumulate = 2 ops)
+    """
+    D = model_cfg.d_model          # 512
+    L = model_cfg.n_layers         # 20
+    H = model_cfg.hidden_dim       # 1536
+    V = model_cfg.vocab_size       # 50257
+    S = train_cfg.seq_len          # sequence length
+
+    # MLA dimensions
+    d_ckv = model_cfg.d_ckv        # 256
+    d_cq = model_cfg.d_cq          # 256
+    d_head = model_cfg.d_head      # 64
+    d_v = model_cfg.d_v            # 64
+    d_rope = model_cfg.d_rope      # 64
+    n_heads = model_cfg.n_heads    # 8
+
+    # MoE dimensions
+    n_routed = model_cfg.n_routed  # 8
+    n_shared = model_cfg.n_shared  # 1
+    top_k = model_cfg.top_k        # 2
+    expert_scale = model_cfg.expert_scale  # 4
+    routed_hidden = H // expert_scale  # 384
+
+    # DSA dimensions
+    topk = S if dsa_warmup else model_cfg.dsa_topk  # dense vs sparse
+
+    # === Per-layer FLOPs (per token) ===
+
+    # MLA projections (all per token)
+    mla_proj = (
+        2 * D * d_ckv +                    # w_dkv
+        2 * d_ckv * (d_head * n_heads) +   # w_uk
+        2 * d_ckv * (d_v * n_heads) +      # w_uv
+        2 * D * d_cq +                     # w_dq
+        2 * d_cq * (d_head * n_heads) +    # w_uq
+        2 * d_cq * (d_rope * n_heads) +    # w_qr
+        2 * D * d_rope +                   # w_kr
+        2 * (d_v * n_heads) * D            # w_out
+    )
+
+    # Attention compute (per token, amortized over sequence)
+    # QK^T: 2 * n_heads * topk * (d_head + rope_dim)
+    # softmax: ~5 * n_heads * topk (exp, sum, div)
+    # AV: 2 * n_heads * topk * d_v
+    rope_dim = d_rope * 2 if model_cfg.rope_type == 'pope' else d_rope
+    attn_compute = (
+        2 * n_heads * topk * (d_head + rope_dim) +  # QK^T
+        5 * n_heads * topk +                         # softmax
+        2 * n_heads * topk * d_v                     # AV
+    )
+
+    # MoE FLOPs (per token)
+    # Shared experts: full SwiGLU
+    shared_flops = n_shared * (2 * D * H + 2 * D * H + 2 * H * D)  # w1, w2, w3
+
+    # Routed experts: top_k activated, smaller hidden
+    routed_flops = top_k * (2 * D * routed_hidden * 2 + 2 * routed_hidden * D)  # w12 fused, w3
+
+    # Router
+    router_flops = 2 * D * n_routed
+
+    moe_total = shared_flops + routed_flops + router_flops
+
+    # Total per layer
+    layer_flops = mla_proj + attn_compute + moe_total
+
+    # === Model-level FLOPs ===
+
+    # Embedding lookup (negligible, but include for completeness)
+    embed_flops = D  # just a lookup
+
+    # LM head
+    lm_head_flops = 2 * D * V
+
+    # MTP modules (mtp_depth extra transformer blocks, slightly shorter sequences)
+    mtp_flops = model_cfg.mtp_depth * layer_flops * 0.95  # ~5% shorter due to shifting
+
+    # Total per token (forward only)
+    total_forward = embed_flops + L * layer_flops + lm_head_flops + mtp_flops
+
+    # Training = forward + backward (backward ≈ 2x forward)
+    total_train = 3 * total_forward
+
+    return total_train
 
 
 def _strip_position_buffers(state_dict: dict) -> dict:
@@ -112,8 +204,11 @@ class Trainer():
         self._dsa_warmup_active = False
         self._gamma_active = model_config.gamma
         self.num_params = sum(p.numel() for p in self.model.parameters())
-        self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
+        # Accurate FLOP calculation for MoE + MLA (updates based on DSA warmup state)
+        self._flops_per_token_warmup = compute_flops_per_token(model_config, config, dsa_warmup=True)
+        self._flops_per_token_sparse = compute_flops_per_token(model_config, config, dsa_warmup=False)
+        self.flops_per_step = self._flops_per_token_warmup * self.tokens_per_step
         self._seq_len_switched = False
         # Note: GradScaler removed - not needed for BF16 (only for FP16)
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,10 +250,18 @@ class Trainer():
 
     def _set_seq_len(self, seq_len):
         self.config.seq_len = seq_len
+        # Adjust batch size for seq_len change
+        # 512→1024: bs/12, accum*8 (warmup bs=24,accum=1 → sparse bs=2,accum=8)
+        if seq_len > 512:
+            self.config.batch_size = max(1, self.config.batch_size // 12)
+            self.config.accumulation_steps = self.config.accumulation_steps * 8
         self.train_loader = self._build_loader("train", seq_len)
         self.val_loader = self._build_loader("val", seq_len)
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
-        self.flops_per_step = 6 * self.num_params * self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
+        # Recalculate FLOPs for new seq_len
+        self._flops_per_token_warmup = compute_flops_per_token(self.model_config, self.config, dsa_warmup=True)
+        self._flops_per_token_sparse = compute_flops_per_token(self.model_config, self.config, dsa_warmup=False)
+        self.flops_per_step = self._flops_per_token_sparse * self.tokens_per_step  # Post-warmup uses sparse
         self.scheduler = LambdaLR(
             self.optimizer,
             lr_lambda=self.get_lr_lambda(self.config.warmup_steps, self.config.max_steps),
@@ -175,6 +278,8 @@ class Trainer():
         if self.rank == 0:
             print(f"Switching seq_len from {self.config.seq_len} to {target} after DSA warmup.")
         self._seq_len_switched = True
+        # Clear cache before rebuilding loaders to avoid memory spike
+        torch.cuda.empty_cache()
         self._set_seq_len(target)
         return True
 
@@ -203,6 +308,9 @@ class Trainer():
         if warmup == self._dsa_warmup_active:
             return
         self._dsa_warmup_active = warmup
+        # Update FLOP calculation (dense during warmup, sparse after)
+        flops_per_token = self._flops_per_token_warmup if warmup else self._flops_per_token_sparse
+        self.flops_per_step = flops_per_token * self.tokens_per_step
         for name, p in self.model.named_parameters():
             if "indexer" in name:
                 p.requires_grad_(True)
@@ -237,6 +345,13 @@ class Trainer():
             main_logits, mtp_logits, dsa_kl, moe_balance = self.model(
                 x, dsa_warmup=dsa_warmup, compute_aux=True
             )
+            # NaN detection
+            if torch.isnan(main_logits).any():
+                print(f"[NaN] main_logits at step {self.step}")
+            if dsa_kl is not None and torch.isnan(dsa_kl):
+                print(f"[NaN] dsa_kl at step {self.step}: {dsa_kl}")
+            if moe_balance is not None and torch.isnan(moe_balance):
+                print(f"[NaN] moe_balance at step {self.step}: {moe_balance}")
             main_loss = F.cross_entropy(main_logits.reshape(-1, main_logits.size(-1)), y.reshape(-1))
             mtp_losses = []
             for depth, logits in enumerate(mtp_logits, start=1):
@@ -322,7 +437,11 @@ class Trainer():
                         pbar.refresh()
                     break
                 start_t = time.perf_counter()
-                loss, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda = self.train_step(batch)
+                # Only sync gradients on the last accumulation step (32x fewer all-reduces!)
+                is_last_accum = (microstep + 1) % self.config.accumulation_steps == 0
+                sync_context = contextlib.nullcontext() if is_last_accum else self.model.no_sync()
+                with sync_context:
+                    loss, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda = self.train_step(batch)
                 end_t = time.perf_counter()
                 accum_time += (end_t - start_t)
                 microstep += 1
@@ -502,10 +621,11 @@ if __name__ == "__main__":
         model_config.original_seq_len = args.original_seq_len
     else:
         if model_config.original_seq_len != train_config.seq_len and rank == 0:
-            print(
-                f"Aligning original_seq_len ({model_config.original_seq_len}) "
-                f"to training seq_len ({train_config.seq_len}) for YaRN."
-            )
+            if model_config.rope_type == 'rope':
+                print(
+                    f"Aligning original_seq_len ({model_config.original_seq_len}) "
+                    f"to training seq_len ({train_config.seq_len}) for YaRN."
+                )
         model_config.original_seq_len = train_config.seq_len
 
     if args.max_seq_len is not None:
@@ -599,5 +719,11 @@ if __name__ == "__main__":
     if resume_state is not None and args.load_weights_only and rank == 0:
         print("Loaded weights only; optimizer/scheduler state reset.")
     if rank == 0:
-        print(f"Model and trainer initialized!\nParameters: {trainer.num_params}")
+        flops_warmup = trainer._flops_per_token_warmup
+        flops_sparse = trainer._flops_per_token_sparse
+        print(f"Model and trainer initialized!")
+        print(f"  Parameters: {trainer.num_params:,}")
+        print(f"  FLOPs/token (DSA warmup): {flops_warmup:,.0f} ({flops_warmup/1e9:.2f}G)")
+        print(f"  FLOPs/token (sparse):     {flops_sparse:,.0f} ({flops_sparse/1e9:.2f}G)")
+        print(f"  Peak FLOPS: {train_config.peak_flops/1e12:.1f} TFLOPS")
     trainer.train()

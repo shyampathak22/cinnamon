@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from norm import RMSNorm
+from kernels import sparse_attention
 
 
 class RoPE(nn.Module):
@@ -285,12 +286,14 @@ class DSAIndexer(nn.Module):
         weights = self.weights_proj(x.float()) * (self.n_heads ** -0.5)
 
         if self.use_fp8 and x.is_cuda and self._quantize_fp8_rowwise is not None:
-            q_flat = q.reshape(-1, self.d_head).contiguous()
-            k_flat = k.reshape(-1, self.d_head).contiguous()
+            # Use actual dimension after positional encoding (PoPE expands d_rope -> 2*d_rope)
+            actual_dim = q.size(-1)
+            q_flat = q.reshape(-1, actual_dim).contiguous()
+            k_flat = k.reshape(-1, actual_dim).contiguous()
             q_fp8, q_scale = self._quantize_fp8_rowwise(q_flat, block_size=128)
             k_fp8, k_scale = self._quantize_fp8_rowwise(k_flat, block_size=128)
-            q_fp8 = q_fp8.view(bsz, seqlen, self.n_heads, self.d_head)
-            k_fp8 = k_fp8.view(bsz, seqlen, self.d_head)
+            q_fp8 = q_fp8.view(bsz, seqlen, self.n_heads, actual_dim)
+            k_fp8 = k_fp8.view(bsz, seqlen, actual_dim)
             q_scale = q_scale.view(bsz, seqlen, self.n_heads, -1)[..., 0]
             k_scale = k_scale.view(bsz, seqlen, -1)[..., 0]
 
@@ -315,7 +318,7 @@ class MultiheadLatentAttention(nn.Module):
                  dsa_topk, local_window, n_indexer_heads, d_indexer_head, rms_eps,
                  rope_base, rope_type='rope', pope_delta_init='zero',
                  original_seq_len=None, rope_factor=1.0, beta_fast=32, beta_slow=1, mscale=1.0,
-                 indexer_use_fp8=True, indexer_use_hadamard=True):
+                 indexer_use_fp8=True, indexer_use_hadamard=True, use_sparse_kernel=False):
         super().__init__()
         self.n_head = n_head
         self.d_head = d_head
@@ -325,6 +328,7 @@ class MultiheadLatentAttention(nn.Module):
         self.rope_type = rope_type
         self.dsa_topk = dsa_topk
         self.local_window = local_window
+        self.use_sparse_kernel = use_sparse_kernel
         self.original_seq_len = original_seq_len if original_seq_len is not None else max_seq_len
         self.rope_factor = rope_factor
 
@@ -337,9 +341,11 @@ class MultiheadLatentAttention(nn.Module):
         self.q_norm = RMSNorm(d_cq, eps=rms_eps)
         self.w_uq = nn.Linear(d_cq, d_head * n_head, bias=False)
 
-        # Decoupled positional projections
+        # Decoupled positional projections (with normalization for PoPE stability)
         self.w_qr = nn.Linear(d_cq, d_rope * n_head, bias=False)
         self.w_kr = nn.Linear(d_model, d_rope, bias=False)
+        self.qr_norm = RMSNorm(d_rope * n_head, eps=rms_eps)
+        self.kr_norm = RMSNorm(d_rope, eps=rms_eps)
 
         # Positional encoding: RoPE (default) or PoPE
         if rope_type == 'rope':
@@ -370,17 +376,27 @@ class MultiheadLatentAttention(nn.Module):
             scale = 0.1 * mscale * math.log(rope_factor) + 1.0
             self.softmax_scale *= scale * scale
 
-    def sparse_attention(self, query, key, value, scale, attn_mask=None, return_weights=False):
-        scores = torch.einsum('bhld,bhlkd->bhlk', query, key) * scale
-        if attn_mask is not None:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
-        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
-        # Cast back to value dtype for einsum compatibility
-        attn_weights = attn_weights.to(value.dtype)
-        output = torch.einsum('bhlk,bhlkd->bhld', attn_weights, value)
-        if return_weights:
-            return output, attn_weights
-        return output
+    def _create_sparse_mask(self, idx, seq_len, device):
+        """
+        Create sparse attention mask from top-k indices, combined with causal mask.
+
+        Args:
+            idx: [B, L, K] - selected key indices for each query position
+            seq_len: sequence length L
+            device: torch device
+
+        Returns:
+            mask: [B, 1, L, L] - True where attention is allowed (sparse + causal)
+        """
+        B, L, K = idx.shape
+        # Create [B, L, L] mask initialized to False
+        mask = torch.zeros(B, L, L, dtype=torch.bool, device=device)
+        # Scatter True at selected positions for each query
+        mask.scatter_(2, idx, True)
+        # Combine with causal mask (can only attend to positions <= current)
+        causal = torch.tril(torch.ones(L, L, dtype=torch.bool, device=device))
+        mask = mask & causal
+        return mask.unsqueeze(1)  # [B, 1, L, L] for head broadcasting
 
     def forward(self, x, dsa_warmup=False, compute_aux=False):
         batch_size, seq_len, _ = x.size()
@@ -410,72 +426,79 @@ class MultiheadLatentAttention(nn.Module):
                 index_scores = index_scores + local_mask.unsqueeze(0).to(index_scores.dtype) * 1e4
             idx = index_scores.topk(topk, dim=-1).indices
 
-            # Single gather for both c_kv and x (same indices, halves memory bandwidth)
-            batch_idx = torch.arange(batch_size, device=x.device)[:, None, None]
-            combined = torch.cat([c_kv, x], dim=-1)
-            combined_selected = combined[batch_idx, idx]
-            ckv_selected = combined_selected[..., :c_kv.size(-1)]
-            x_selected = combined_selected[..., c_kv.size(-1):]
-
+        # Query projections (same for both paths)
         query_c = self.w_uq(c_q).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
-        q_rope_input = self.w_qr(c_q).view(batch_size, seq_len, self.n_head, self.d_rope)
+        q_rope_input = self.qr_norm(self.w_qr(c_q)).view(batch_size, seq_len, self.n_head, self.d_rope)
 
         if self.rope_type == 'rope':
             query_r = self.pos_enc(q_rope_input, interleaved=True).transpose(1, 2)
         else:
             query_r = self.pos_enc(q_rope_input, apply_delta=False).transpose(1, 2)
 
+        # Key/value projections - same for both dense warmup and sparse (memory-efficient!)
+        # Keys/values are [B, H, L, D] - no expansion to [B, H, L, K, D]
+        key_c = self.w_uk(c_kv).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
+        value = self.w_uv(c_kv).view(batch_size, seq_len, self.n_head, self.d_v).transpose(1, 2)
+        k_rope_input = self.kr_norm(self.w_kr(x)).unsqueeze(2)
+        if self.rope_type == 'rope':
+            key_r = self.pos_enc(k_rope_input, interleaved=True).squeeze(2)
+        else:
+            key_r = self.pos_enc(k_rope_input, apply_delta=True).squeeze(2)
+        key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1)
+
+        query = torch.cat((query_c, query_r), dim=-1)
+        key = torch.cat((key_c, key_r), dim=-1)
+
         scale = self.softmax_scale
 
         if dsa_warmup:
-            key_c = self.w_uk(c_kv).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
-            value = self.w_uv(c_kv).view(batch_size, seq_len, self.n_head, self.d_v).transpose(1, 2)
-            k_rope_input = self.w_kr(x).unsqueeze(2)
-            if self.rope_type == 'rope':
-                key_r = self.pos_enc(k_rope_input, interleaved=True).squeeze(2)
-            else:
-                key_r = self.pos_enc(k_rope_input, apply_delta=True).squeeze(2)
-            key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1)
-
-            query = torch.cat((query_c, query_r), dim=-1)
-            key = torch.cat((key_c, key_r), dim=-1)
-
+            # Dense attention (warmup phase) - O(L^2)
             scores = torch.einsum('bhld,bhsd->bhls', query, key) * scale
             scores = scores + causal_mask.unsqueeze(1)
             attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(value.dtype)
             attn_o = torch.einsum('bhls,bhsd->bhld', attn_weights, value)
+            sparse_attn_weights = None
+        elif self.use_sparse_kernel:
+            # TRUE sparse attention - O(L*K) compute and memory
+            attn_o, sparse_attn_weights = sparse_attention(query, key, value, idx, scale)
         else:
-            key_c = self.w_uk(ckv_selected).view(batch_size, seq_len, -1, self.n_head, self.d_head).permute(0, 3, 1, 2, 4)
-            value = self.w_uv(ckv_selected).view(batch_size, seq_len, -1, self.n_head, self.d_v).permute(0, 3, 1, 2, 4)
-            k_rope_input = self.w_kr(x_selected)
-            if self.rope_type == 'rope':
-                key_r = self.pos_enc(k_rope_input, positions=idx, interleaved=True)
-            else:
-                key_r = self.pos_enc(k_rope_input, apply_delta=True, positions=idx)
-            key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1, -1)
-
-            query = torch.cat((query_c, query_r), dim=-1)
-            key = torch.cat((key_c, key_r), dim=-1)
-
-            positions = torch.arange(seq_len, device=x.device)
-            valid = idx <= positions[None, :, None]
-            attn_mask = valid.unsqueeze(1)
-            attn_o, attn_weights = self.sparse_attention(
-                query, key, value, scale=scale, attn_mask=attn_mask, return_weights=True
-            )
+            # Fallback: dense + mask (O(L^2) compute, for testing/comparison)
+            scores = torch.einsum('bhld,bhsd->bhls', query, key) * scale
+            sparse_mask = self._create_sparse_mask(idx, seq_len, x.device)
+            scores = scores.masked_fill(~sparse_mask, float("-inf"))
+            attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(value.dtype)
+            attn_o = torch.einsum('bhls,bhsd->bhld', attn_weights, value)
+            sparse_attn_weights = None
 
         attn_o = attn_o.transpose(1, 2).reshape(batch_size, seq_len, self.n_head * self.d_v)
         out = self.w_out(attn_o)
 
         aux_loss = None
         if compute_aux:
-            p = attn_weights.sum(dim=1)
-            p = p / (p.sum(dim=-1, keepdim=True) + 1e-9)
             if dsa_warmup:
+                # Dense: attention weights are [B, H, L, L]
+                p = attn_weights.sum(dim=1)  # [B, L, L]
+                p = p / (p.sum(dim=-1, keepdim=True) + 1e-9)
                 log_q = F.log_softmax(index_scores, dim=-1)
                 log_q = log_q.masked_fill(~torch.isfinite(index_scores), 0.0)
-            else:
+            elif self.use_sparse_kernel:
+                # TRUE sparse: sparse_attn_weights is already [B, H, L, K]
+                p = sparse_attn_weights.float().sum(dim=1)  # [B, L, K]
+                p = p / (p.sum(dim=-1, keepdim=True) + 1e-9)
                 log_q = F.log_softmax(index_scores.gather(-1, idx), dim=-1)
+                positions = torch.arange(seq_len, device=x.device)
+                valid = idx <= positions[None, :, None]
+                log_q = log_q.masked_fill(~valid, 0.0)
+            else:
+                # Fallback sparse: gather attention weights at selected positions
+                # attn_weights is [B, H, L, L], gather to [B, H, L, K] using idx
+                idx_expanded = idx.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # [B, H, L, K]
+                p = attn_weights.gather(-1, idx_expanded)  # [B, H, L, K]
+                p = p.sum(dim=1)  # [B, L, K]
+                p = p / (p.sum(dim=-1, keepdim=True) + 1e-9)
+                log_q = F.log_softmax(index_scores.gather(-1, idx), dim=-1)
+                positions = torch.arange(seq_len, device=x.device)
+                valid = idx <= positions[None, :, None]
                 log_q = log_q.masked_fill(~valid, 0.0)
             p = p.detach()
             aux_loss = (p * (p.clamp_min(1e-9).log() - log_q)).sum(dim=-1).mean()
