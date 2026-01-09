@@ -528,6 +528,7 @@ def moe_grouped_gemm(
     weights: torch.Tensor,       # (n_experts, d_out, d_in)
     expert_starts: torch.Tensor, # (n_experts,)
     expert_ends: torch.Tensor,   # (n_experts,)
+    max_expert_tokens: int = None,  # Max tokens assigned to any single expert
 ) -> torch.Tensor:
     """
     Grouped GEMM for MoE: each expert processes its slice of tokens.
@@ -537,6 +538,7 @@ def moe_grouped_gemm(
         weights: Expert weight matrices (n_experts, d_out, d_in)
         expert_starts: Start indices for each expert
         expert_ends: End indices for each expert
+        max_expert_tokens: Max tokens for any expert (avoids over-launching kernels)
 
     Returns:
         Output tensor (total_tokens, d_out)
@@ -548,14 +550,16 @@ def moe_grouped_gemm(
     out = torch.empty((total_tokens, d_out), dtype=torch.float16, device=sorted_x.device)
 
     # Block sizes
-    BLOCK_M = 32
+    BLOCK_M = 64  # Increased from 32 for better occupancy
     BLOCK_N = 64
     BLOCK_K = 32
 
     # Grid: (n_experts, max_tiles_m, tiles_n)
-    # Use total_tokens as upper bound to avoid CPU sync from .item()
-    # Kernel has early-exit for empty ranges, so excess blocks just return
-    max_tiles_m = triton.cdiv(total_tokens, BLOCK_M)
+    # Use actual max_expert_tokens to avoid launching ~n_experts× too many kernels
+    if max_expert_tokens is None:
+        # Fallback: assume even distribution with 2x buffer for imbalance
+        max_expert_tokens = (total_tokens // n_experts) * 2 + BLOCK_M
+    max_tiles_m = triton.cdiv(max_expert_tokens, BLOCK_M)
     grid = (
         n_experts,
         max_tiles_m,
@@ -932,135 +936,118 @@ def sparse_attention_fwd_kernel(
     # Scale factor
     scale,
     # Block sizes
+    BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """
     TRUE sparse attention forward kernel with FlashAttention-style online softmax.
 
-    Two-pass algorithm for correctness:
-    1. PASS 1: Compute all scores and global log-sum-exp (LSE)
-    2. PASS 2: Compute normalized attention weights and output
+    Processes BLOCK_Q query positions per kernel launch to reduce launch overhead.
+    Grid: (B, cdiv(L, BLOCK_Q), H) instead of (B, L, H)
 
-    This ensures numerically stable softmax with correct attention weights.
     Complexity: O(L * K_sparse * D) instead of O(L^2 * D)
     """
     pid_b = tl.program_id(0)
-    pid_l = tl.program_id(1)
+    pid_q = tl.program_id(1)
     pid_h = tl.program_id(2)
 
-    t = pid_l
-
-    # Base pointers
-    q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
+    # Base pointers for this batch/head
     k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh
     v_base = V_ptr + pid_b * stride_vb + pid_h * stride_vh
-    idx_base = Idx_ptr + pid_b * stride_ib + t * stride_il
-
-    # Load query vector (assume D_qk <= BLOCK_D)
     d_offs = tl.arange(0, BLOCK_D)
     q_mask = d_offs < D_qk
-    q = tl.load(q_base + d_offs * stride_qd, mask=q_mask, other=0.0).to(tl.float32)
+    v_mask = d_offs < D_v
 
-    # =========================================================================
-    # PASS 1: Compute scores and find global max for numerically stable softmax
-    # Uses online max-finding with proper Triton semantics (no Python conditionals)
-    # =========================================================================
-    global_max = float('-inf')
-    global_sum = 0.0
+    # Process BLOCK_Q queries in this kernel
+    for q_idx in range(BLOCK_Q):
+        t = pid_q * BLOCK_Q + q_idx
+        # Guard all work inside t < L check (Triton doesn't support continue)
+        if t < L:
+            # Load query for this position
+            q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
+            idx_base = Idx_ptr + pid_b * stride_ib + t * stride_il
 
-    for k_start in range(0, K_sparse, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < K_sparse
+            q = tl.load(q_base + d_offs * stride_qd, mask=q_mask, other=0.0).to(tl.float32)
 
-        # Load sparse indices
-        idx = tl.load(idx_base + k_offs * stride_ik, mask=k_mask, other=0)
+            # PASS 1: Online softmax - compute max and sum
+            global_max = float('-inf')
+            global_sum = 0.0
 
-        # Causal + bounds masking
-        valid_mask = k_mask & (idx <= t)
+            for k_start in range(0, K_sparse, BLOCK_K):
+                k_offs = k_start + tl.arange(0, BLOCK_K)
+                k_mask = k_offs < K_sparse
 
-        # Gather keys and compute scores
-        k_gathered = tl.load(
-            k_base + idx[:, None] * stride_kl + d_offs[None, :] * stride_kd,
-            mask=valid_mask[:, None] & q_mask[None, :],
-            other=0.0
-        ).to(tl.float32)
+                idx = tl.load(idx_base + k_offs * stride_ik, mask=k_mask, other=0)
+                valid_mask = k_mask & (idx <= t)
 
-        scores = tl.sum(q[None, :] * k_gathered, axis=1) * scale
-        scores = tl.where(valid_mask, scores, float('-inf'))
+                k_gathered = tl.load(
+                    k_base + idx[:, None] * stride_kl + d_offs[None, :] * stride_kd,
+                    mask=valid_mask[:, None] & q_mask[None, :],
+                    other=0.0
+                ).to(tl.float32)
 
-        # Online max update (Triton-compatible, no Python if)
-        block_max = tl.max(scores)
-        # Keep old max if block is all -inf
-        block_max = tl.where(block_max == float('-inf'), global_max, block_max)
-        new_max = tl.maximum(global_max, block_max)
+                scores = tl.sum(q[None, :] * k_gathered, axis=1) * scale
+                scores = tl.where(valid_mask, scores, float('-inf'))
 
-        # Rescale previous sum with correction factor
-        correction = tl.exp(global_max - new_max)
-        global_sum = global_sum * correction
+                block_max = tl.max(scores)
+                block_max = tl.where(block_max == float('-inf'), global_max, block_max)
+                new_max = tl.maximum(global_max, block_max)
 
-        # Add current block's contribution
-        exp_scores = tl.exp(scores - new_max)
-        exp_scores = tl.where(valid_mask, exp_scores, 0.0)
-        global_sum = global_sum + tl.sum(exp_scores)
+                correction = tl.exp(global_max - new_max)
+                global_sum = global_sum * correction
 
-        global_max = new_max
+                exp_scores = tl.exp(scores - new_max)
+                exp_scores = tl.where(valid_mask, exp_scores, 0.0)
+                global_sum = global_sum + tl.sum(exp_scores)
 
-    # Compute final LSE = max + log(sum)
-    # Handle edge case: all positions masked
-    has_valid = global_sum > 0
-    safe_sum = tl.where(has_valid, global_sum, 1.0)
-    safe_max = tl.where(has_valid, global_max, 0.0)
-    lse = safe_max + tl.log(safe_sum)
+                global_max = new_max
 
-    # =========================================================================
-    # PASS 2: Compute normalized attention weights and accumulate output
-    # Weights = exp(score - LSE) which is numerically stable
-    # =========================================================================
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+            has_valid = global_sum > 0
+            safe_sum = tl.where(has_valid, global_sum, 1.0)
+            safe_max = tl.where(has_valid, global_max, 0.0)
+            lse = safe_max + tl.log(safe_sum)
 
-    for k_start in range(0, K_sparse, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < K_sparse
+            # PASS 2: Compute output with normalized weights
+            acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-        # Load sparse indices (same as pass 1)
-        idx = tl.load(idx_base + k_offs * stride_ik, mask=k_mask, other=0)
-        valid_mask = k_mask & (idx <= t)
+            for k_start in range(0, K_sparse, BLOCK_K):
+                k_offs = k_start + tl.arange(0, BLOCK_K)
+                k_mask = k_offs < K_sparse
 
-        # Recompute scores (required for numerical stability)
-        k_gathered = tl.load(
-            k_base + idx[:, None] * stride_kl + d_offs[None, :] * stride_kd,
-            mask=valid_mask[:, None] & q_mask[None, :],
-            other=0.0
-        ).to(tl.float32)
+                idx = tl.load(idx_base + k_offs * stride_ik, mask=k_mask, other=0)
+                valid_mask = k_mask & (idx <= t)
 
-        scores = tl.sum(q[None, :] * k_gathered, axis=1) * scale
-        scores = tl.where(valid_mask, scores, float('-inf'))
+                k_gathered = tl.load(
+                    k_base + idx[:, None] * stride_kl + d_offs[None, :] * stride_kd,
+                    mask=valid_mask[:, None] & q_mask[None, :],
+                    other=0.0
+                ).to(tl.float32)
 
-        # Normalized attention weights = exp(score - LSE)
-        attn_weights = tl.exp(scores - lse)
-        attn_weights = tl.where(valid_mask, attn_weights, 0.0)
+                scores = tl.sum(q[None, :] * k_gathered, axis=1) * scale
+                scores = tl.where(valid_mask, scores, float('-inf'))
 
-        # Store attention weights for aux loss computation
-        aw_base = AttnW_ptr + pid_b * stride_awb + pid_h * stride_awh + t * stride_awl
-        tl.store(aw_base + k_offs * stride_awk, attn_weights.to(tl.float32), mask=k_mask)
+                attn_weights = tl.exp(scores - lse)
+                attn_weights = tl.where(valid_mask, attn_weights, 0.0)
 
-        # Gather values and accumulate weighted sum
-        v_gathered = tl.load(
-            v_base + idx[:, None] * stride_vl + d_offs[None, :] * stride_vd,
-            mask=valid_mask[:, None] & (d_offs[None, :] < D_v),
-            other=0.0
-        ).to(tl.float32)
+                # Store attention weights
+                aw_base = AttnW_ptr + pid_b * stride_awb + pid_h * stride_awh + t * stride_awl
+                tl.store(aw_base + k_offs * stride_awk, attn_weights.to(tl.float32), mask=k_mask)
 
-        acc = acc + tl.sum(attn_weights[:, None] * v_gathered, axis=0)
+                v_gathered = tl.load(
+                    v_base + idx[:, None] * stride_vl + d_offs[None, :] * stride_vd,
+                    mask=valid_mask[:, None] & v_mask[None, :],
+                    other=0.0
+                ).to(tl.float32)
 
-    # Store output (as float32, wrapper will convert to input dtype)
-    o_base = O_ptr + pid_b * stride_ob + pid_h * stride_oh + t * stride_ol
-    tl.store(o_base + d_offs * stride_od, acc.to(tl.float32), mask=d_offs < D_v)
+                acc = acc + tl.sum(attn_weights[:, None] * v_gathered, axis=0)
 
-    # Store LSE for backward pass
-    lse_ptr = LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + t * stride_lsel
-    tl.store(lse_ptr, lse)
+            # Store output and LSE
+            o_base = O_ptr + pid_b * stride_ob + pid_h * stride_oh + t * stride_ol
+            tl.store(o_base + d_offs * stride_od, acc.to(tl.float32), mask=v_mask)
+
+            lse_ptr = LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + t * stride_lsel
+            tl.store(lse_ptr, lse)
 
 
 @triton.jit
@@ -1089,130 +1076,101 @@ def sparse_attention_bwd_kernel(
     # Scale factor
     scale,
     # Block sizes
+    BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """
-    Backward kernel for sparse attention.
-
-    Computes dQ (accumulated per query), dK and dV (vectorized atomic scatter-add).
+    Backward kernel for sparse attention with BLOCK_Q queries per launch.
+    Grid: (B, cdiv(L, BLOCK_Q), H) - 64x fewer launches than per-query.
     """
     pid_b = tl.program_id(0)
-    pid_l = tl.program_id(1)
+    pid_q = tl.program_id(1)
     pid_h = tl.program_id(2)
 
-    t = pid_l
-
-    # Base pointers
-    do_base = dO_ptr + pid_b * stride_dob + pid_h * stride_doh + t * stride_dol
-    o_base = O_ptr + pid_b * stride_dob + pid_h * stride_doh + t * stride_dol
-    q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
+    # Base pointers for this batch/head
     k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh
     v_base = V_ptr + pid_b * stride_vb + pid_h * stride_vh
-    idx_base = Idx_ptr + pid_b * stride_ib + t * stride_il
-    dq_base = dQ_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
     dk_base = dK_ptr + pid_b * stride_kb + pid_h * stride_kh
     dv_base = dV_ptr + pid_b * stride_vb + pid_h * stride_vh
 
-    # Load LSE for this position
-    lse_ptr = LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + t * stride_lsel
-    lse = tl.load(lse_ptr)
-
-    # Load dO and O, compute delta = sum(O * dO)
     d_offs = tl.arange(0, BLOCK_D)
-    d_mask = d_offs < D_v
+    d_mask_v = d_offs < D_v
+    d_mask_qk = d_offs < D_qk
 
-    do_ptrs = do_base + d_offs * stride_dod
-    o_ptrs = o_base + d_offs * stride_dod
+    # Process BLOCK_Q queries
+    for q_idx in range(BLOCK_Q):
+        t = pid_q * BLOCK_Q + q_idx
+        if t < L:
+            # Per-query bases
+            do_base = dO_ptr + pid_b * stride_dob + pid_h * stride_doh + t * stride_dol
+            o_base = O_ptr + pid_b * stride_dob + pid_h * stride_doh + t * stride_dol
+            q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
+            idx_base = Idx_ptr + pid_b * stride_ib + t * stride_il
+            dq_base = dQ_ptr + pid_b * stride_qb + pid_h * stride_qh + t * stride_ql
 
-    dO = tl.load(do_ptrs, mask=d_mask, other=0.0).to(tl.float32)
-    O = tl.load(o_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+            # Load LSE
+            lse_ptr = LSE_ptr + pid_b * stride_lseb + pid_h * stride_lseh + t * stride_lsel
+            lse = tl.load(lse_ptr)
 
-    delta = tl.sum(dO * O)
+            # Load dO, O, compute delta
+            dO = tl.load(do_base + d_offs * stride_dod, mask=d_mask_v, other=0.0).to(tl.float32)
+            O = tl.load(o_base + d_offs * stride_dod, mask=d_mask_v, other=0.0).to(tl.float32)
+            delta = tl.sum(dO * O)
 
-    # Load query for dK computation
-    q_offs = tl.arange(0, BLOCK_D)
-    q_mask = q_offs < D_qk
-    q = tl.load(q_base + q_offs * stride_qd, mask=q_mask, other=0.0).to(tl.float32)
+            # Load query
+            q = tl.load(q_base + d_offs * stride_qd, mask=d_mask_qk, other=0.0).to(tl.float32)
 
-    # dQ accumulator
-    dq = tl.zeros([BLOCK_D], dtype=tl.float32)
+            # dQ accumulator
+            dq = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    # Process K_sparse positions
-    for k_start in range(0, K_sparse, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < K_sparse
+            for k_start in range(0, K_sparse, BLOCK_K):
+                k_offs = k_start + tl.arange(0, BLOCK_K)
+                k_mask = k_offs < K_sparse
 
-        # Load indices
-        idx_ptrs = idx_base + k_offs * stride_ik
-        idx = tl.load(idx_ptrs, mask=k_mask, other=0)
+                idx = tl.load(idx_base + k_offs * stride_ik, mask=k_mask, other=0)
+                valid_mask = k_mask & (idx <= t)
 
-        # Causal validity
-        causal_valid = idx <= t
-        valid_mask = k_mask & causal_valid
+                # Gather keys and compute scores
+                k_gathered = tl.load(
+                    k_base + idx[:, None] * stride_kl + d_offs[None, :] * stride_kd,
+                    mask=valid_mask[:, None] & d_mask_qk[None, :], other=0.0
+                ).to(tl.float32)
 
-        # Recompute scores
-        scores = tl.zeros([BLOCK_K], dtype=tl.float32)
-        for d_start in range(0, D_qk, BLOCK_D):
-            d_offs_inner = d_start + tl.arange(0, BLOCK_D)
-            d_mask_inner = d_offs_inner < D_qk
+                scores = tl.sum(q[None, :] * k_gathered, axis=1) * scale
+                scores = tl.where(valid_mask, scores, float('-inf'))
 
-            q_tile = tl.load(q_base + d_offs_inner * stride_qd, mask=d_mask_inner, other=0.0).to(tl.float32)
-            k_ptrs = k_base + idx[:, None] * stride_kl + d_offs_inner[None, :] * stride_kd
-            k_tile = tl.load(k_ptrs, mask=valid_mask[:, None] & d_mask_inner[None, :], other=0.0).to(tl.float32)
+                p = tl.exp(scores - lse)
+                p = tl.where(valid_mask, p, 0.0)
 
-            scores += tl.sum(q_tile[None, :] * k_tile, axis=1)
+                # Gather values
+                v_tile = tl.load(
+                    v_base + idx[:, None] * stride_vl + d_offs[None, :] * stride_vd,
+                    mask=valid_mask[:, None] & d_mask_v[None, :], other=0.0
+                ).to(tl.float32)
 
-        scores = scores * scale
-        scores = tl.where(valid_mask, scores, float('-inf'))
+                # dp = p * (dO · V - delta)
+                dO_v = tl.sum(dO[None, :] * v_tile, axis=1)
+                dp = p * (dO_v - delta)
+                dp = tl.where(valid_mask, dp, 0.0)
 
-        # Attention weights: p = exp(score - lse)
-        p = tl.exp(scores - lse)
-        p = tl.where(valid_mask, p, 0.0)
+                # dQ += sum_k(dp[k] * K[idx[k]]) * scale
+                dq += tl.sum(dp[:, None] * k_gathered, axis=0) * scale
 
-        # Gather V for dp computation: v_tile is [BLOCK_K, D_v]
-        v_d_offs = tl.arange(0, BLOCK_D)
-        v_ptrs = v_base + idx[:, None] * stride_vl + v_d_offs[None, :] * stride_vd
-        v_mask = valid_mask[:, None] & (v_d_offs[None, :] < D_v)
-        v_tile = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
+                # dK and dV via atomic adds (one element at a time)
+                # Load q/dO elements individually - Triton can't index tensors with scalars
+                for d_idx in tl.static_range(BLOCK_D):
+                    if d_idx < D_qk:
+                        q_elem = tl.load(q_base + d_idx * stride_qd)
+                        dk_col = dp * q_elem * scale  # [BLOCK_K] * scalar
+                        tl.atomic_add(dk_base + idx * stride_kl + d_idx * stride_kd, dk_col, mask=valid_mask)
+                    if d_idx < D_v:
+                        dO_elem = tl.load(do_base + d_idx * stride_dod)
+                        dv_col = p * dO_elem  # [BLOCK_K] * scalar
+                        tl.atomic_add(dv_base + idx * stride_vl + d_idx * stride_vd, dv_col, mask=valid_mask)
 
-        # dp = p * (dO · V - delta) for each k
-        dO_v = tl.sum(dO[None, :] * v_tile, axis=1)  # [BLOCK_K]
-        dp = p * (dO_v - delta)
-        dp = tl.where(valid_mask, dp, 0.0)
-
-        # dQ += sum_k(dp[k] * K[idx[k]]) * scale
-        k_d_offs = tl.arange(0, BLOCK_D)
-        k_gathered = tl.load(k_base + idx[:, None] * stride_kl + k_d_offs[None, :] * stride_kd,
-                            mask=valid_mask[:, None] & (k_d_offs[None, :] < D_qk), other=0.0).to(tl.float32)
-        dq += tl.sum(dp[:, None] * k_gathered, axis=0) * scale
-
-        # Compute outer products for dK and dV contributions
-        # dk_contrib[k, d] = dp[k] * q[d] * scale -> [BLOCK_K, BLOCK_D]
-        # dv_contrib[k, d] = p[k] * dO[d] -> [BLOCK_K, BLOCK_D]
-        dk_contrib = dp[:, None] * q[None, :] * scale
-        dv_contrib = p[:, None] * dO[None, :]
-
-        # Vectorized atomic adds - tile over D dimension
-        for d_start in range(0, BLOCK_D, 1):
-            d_idx = d_start
-            if d_idx < D_qk:
-                # Extract column d from dk_contrib and atomically add
-                # Use masking to get the d-th column
-                col_mask = tl.arange(0, BLOCK_D) == d_idx
-                dk_col = tl.sum(tl.where(col_mask[None, :], dk_contrib, 0.0), axis=1)
-                dk_ptrs = dk_base + idx * stride_kl + d_idx * stride_kd
-                tl.atomic_add(dk_ptrs, dk_col.to(tl.float32), mask=valid_mask)
-
-            if d_idx < D_v:
-                col_mask = tl.arange(0, BLOCK_D) == d_idx
-                dv_col = tl.sum(tl.where(col_mask[None, :], dv_contrib, 0.0), axis=1)
-                dv_ptrs = dv_base + idx * stride_vl + d_idx * stride_vd
-                tl.atomic_add(dv_ptrs, dv_col.to(tl.float32), mask=valid_mask)
-
-    # Store dQ
-    dq_d_offs = tl.arange(0, BLOCK_D)
-    tl.store(dq_base + dq_d_offs * stride_qd, dq.to(tl.float32), mask=dq_d_offs < D_qk)
+            # Store dQ
+            tl.store(dq_base + d_offs * stride_qd, dq.to(tl.float32), mask=d_mask_qk)
 
 
 class SparseAttentionFunction(torch.autograd.Function):
@@ -1248,9 +1206,10 @@ class SparseAttentionFunction(torch.autograd.Function):
         lse = torch.empty(B, H, L, device=q.device, dtype=torch.float32)
         attn_weights = torch.empty(B, H, L, K_sparse, device=q.device, dtype=torch.float32)
 
-        # Block sizes
-        BLOCK_K = min(32, triton.next_power_of_2(K_sparse))
-        BLOCK_D = min(64, triton.next_power_of_2(max(D_qk, D_v)))
+        # Block sizes - BLOCK_Q reduces kernel launches by 64x
+        BLOCK_Q = 64
+        BLOCK_K = min(64, triton.next_power_of_2(K_sparse))  # Process more K per iteration
+        BLOCK_D = triton.next_power_of_2(max(D_qk, D_v))  # No cap - PoPE needs 192
 
         # Ensure tensors are contiguous
         q = q.contiguous()
@@ -1258,8 +1217,8 @@ class SparseAttentionFunction(torch.autograd.Function):
         v = v.contiguous()
         idx = idx.contiguous()
 
-        # Launch kernel
-        grid = (B, L, H)
+        # Launch kernel - grid reduced by BLOCK_Q
+        grid = (B, triton.cdiv(L, BLOCK_Q), H)
         sparse_attention_fwd_kernel[grid](
             q, k, v, idx,
             output, lse, attn_weights,
@@ -1272,6 +1231,7 @@ class SparseAttentionFunction(torch.autograd.Function):
             lse.stride(0), lse.stride(1), lse.stride(2),
             attn_weights.stride(0), attn_weights.stride(1), attn_weights.stride(2), attn_weights.stride(3),
             scale,
+            BLOCK_Q=BLOCK_Q,
             BLOCK_K=BLOCK_K,
             BLOCK_D=BLOCK_D,
             num_warps=4,
@@ -1305,8 +1265,9 @@ class SparseAttentionFunction(torch.autograd.Function):
         # Ensure contiguous
         grad_output = grad_output.contiguous()
 
-        # Launch backward kernel
-        grid = (B, L, H)
+        # Launch backward kernel with BLOCK_Q (64x fewer launches)
+        BLOCK_Q = 64
+        grid = (B, triton.cdiv(L, BLOCK_Q), H)
         sparse_attention_bwd_kernel[grid](
             grad_output, output, lse,
             q, k, v, idx,
@@ -1319,6 +1280,7 @@ class SparseAttentionFunction(torch.autograd.Function):
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             idx.stride(0), idx.stride(1), idx.stride(2),
             scale,
+            BLOCK_Q=BLOCK_Q,
             BLOCK_K=ctx.BLOCK_K,
             BLOCK_D=ctx.BLOCK_D,
             num_warps=4,

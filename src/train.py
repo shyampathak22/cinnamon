@@ -679,7 +679,8 @@ if __name__ == "__main__":
                      model_config.beta_slow,
                      model_config.mscale,
                      model_config.indexer_use_fp8,
-                     model_config.indexer_use_hadamard)
+                     model_config.indexer_use_hadamard,
+                     model_config.use_sparse_kernel)
     resume_state = None
     if args.resume is not None:
         resume_state = torch.load(args.resume, map_location="cpu")

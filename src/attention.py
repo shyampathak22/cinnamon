@@ -318,7 +318,7 @@ class MultiheadLatentAttention(nn.Module):
                  dsa_topk, local_window, n_indexer_heads, d_indexer_head, rms_eps,
                  rope_base, rope_type='rope', pope_delta_init='zero',
                  original_seq_len=None, rope_factor=1.0, beta_fast=32, beta_slow=1, mscale=1.0,
-                 indexer_use_fp8=True, indexer_use_hadamard=True, use_sparse_kernel=False):
+                 indexer_use_fp8=True, indexer_use_hadamard=True, use_sparse_kernel=True):
         super().__init__()
         self.n_head = n_head
         self.d_head = d_head

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from layers import Transformer, MTPModule
 from norm import RMSNorm
 
@@ -39,10 +40,12 @@ class Cinnamon(nn.Module):
                  beta_slow=1,
                  mscale=1.0,
                  indexer_use_fp8=True,
-                 indexer_use_hadamard=True):
+                 indexer_use_hadamard=True,
+                 use_sparse_kernel=True):
         super().__init__()
         self.n_layers = n_layers
         self.mtp_depth = mtp_depth
+        self.gradient_checkpointing = False
 
         # init transformer blocks
         self.transformer_layers = nn.ModuleList([
@@ -51,7 +54,7 @@ class Cinnamon(nn.Module):
                 n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
                 n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type, pope_delta_init,
                 original_seq_len, rope_factor, beta_fast, beta_slow, mscale,
-                indexer_use_fp8, indexer_use_hadamard
+                indexer_use_fp8, indexer_use_hadamard, use_sparse_kernel
             )
             for _ in range(self.n_layers)
         ])
@@ -70,7 +73,7 @@ class Cinnamon(nn.Module):
                 n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
                 n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type, pope_delta_init,
                 original_seq_len, rope_factor, beta_fast, beta_slow, mscale,
-                indexer_use_fp8, indexer_use_hadamard
+                indexer_use_fp8, indexer_use_hadamard, use_sparse_kernel
             )
             for _ in range(self.mtp_depth)
         ])
@@ -89,14 +92,33 @@ class Cinnamon(nn.Module):
                 elif p.dim() >= 2:
                     torch.nn.init.normal_(p, mean=0.0, std=0.02)
 
-    def forward(self, input_ids, dsa_warmup=False, compute_aux=False):
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing to reduce memory at cost of compute."""
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+
+    def _run_block(self, block, x, dsa_warmup, compute_aux):
+        """Helper for gradient checkpointing - must be a separate method."""
+        return block(x, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+
+    def forward(self, input_ids, dsa_warmup=False, compute_aux=False, skip_mtp=False):
         # embed once, reuse for MTP (avoid redundant embedding lookup)
         emb = self.embedding(input_ids)
         x = emb
         dsa_kl = None
         moe_balance = None
         for block in self.transformer_layers:
-            x, attn_aux, moe_aux = block(x, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+            if self.gradient_checkpointing and self.training:
+                # Checkpoint each transformer block to save memory
+                x, attn_aux, moe_aux = checkpoint(
+                    self._run_block, block, x, dsa_warmup, compute_aux,
+                    use_reentrant=False
+                )
+            else:
+                x, attn_aux, moe_aux = block(x, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
             if compute_aux:
                 if attn_aux is not None:
                     dsa_kl = attn_aux if dsa_kl is None else dsa_kl + attn_aux
@@ -106,7 +128,7 @@ class Cinnamon(nn.Module):
         main_logits = self.lm_head(self.norm(x))
 
         mtp_logits = []
-        if self.mtp_modules:
+        if self.mtp_modules and not skip_mtp:
             h_prev = x
             for depth, mtp in enumerate(self.mtp_modules, start=1):
                 h_prev = h_prev[:, :-1]

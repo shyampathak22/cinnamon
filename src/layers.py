@@ -53,7 +53,7 @@ class GroupedExperts(nn.Module):
         nn.init.normal_(self.w12, mean=0.0, std=0.02)
         nn.init.normal_(self.w3, mean=0.0, std=0.02)
 
-    def forward(self, sorted_x, expert_starts, expert_ends):
+    def forward(self, sorted_x, expert_starts, expert_ends, max_expert_tokens=None):
         """
         Apply SwiGLU to sorted tokens using grouped GEMM.
 
@@ -61,16 +61,17 @@ class GroupedExperts(nn.Module):
             sorted_x: (total_tokens, d_model) - tokens sorted by expert
             expert_starts: (n_experts,) - start indices
             expert_ends: (n_experts,) - end indices
+            max_expert_tokens: max tokens assigned to any single expert (for grid sizing)
 
         Returns:
             (total_tokens, d_model) - output
         """
         if HAS_GROUPED_GEMM and sorted_x.is_cuda:
             # Fused up-projection: one GEMM instead of two
-            h12 = moe_grouped_gemm(sorted_x, self.w12, expert_starts, expert_ends)
+            h12 = moe_grouped_gemm(sorted_x, self.w12, expert_starts, expert_ends, max_expert_tokens)
             h1, h2 = h12.float().chunk(2, dim=-1)
             h = F.silu(h1) * h2
-            out = moe_grouped_gemm(h.to(sorted_x.dtype), self.w3, expert_starts, expert_ends)
+            out = moe_grouped_gemm(h.to(sorted_x.dtype), self.w3, expert_starts, expert_ends, max_expert_tokens)
             return out.float()
         else:
             # Fallback: sequential expert processing (GPU without kernel or CPU)
@@ -126,18 +127,19 @@ class MoE(nn.Module):
 
         # Efficient MoE: permute-process-unpermute with grouped GEMM
         flat_x = x.view(-1, d)
-        flat_top_idx = top_idx.view(-1, self.top_k)
-        flat_top_scores = top_scores.view(-1, self.top_k)
-
-        # Expand for top_k assignments
         n_tokens = flat_x.size(0)
-        expanded_x = flat_x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, d)
-        expanded_idx = flat_top_idx.view(-1)
-        expanded_scores = flat_top_scores.view(-1)
+
+        # Flatten indices and scores
+        expanded_idx = top_idx.view(-1)  # (n_tokens * top_k,)
+        expanded_scores = top_scores.view(-1)
 
         # Sort by expert for grouped processing
         sorted_idx, sort_order = expanded_idx.sort()
-        sorted_x = expanded_x[sort_order]
+
+        # Memory-efficient gather: map sorted position -> original token index
+        # sort_order[i] is the original expanded position, divide by top_k to get token
+        token_indices = sort_order // self.top_k
+        sorted_x = flat_x[token_indices]  # Gather directly, no expanded_x allocation
         sorted_scores = expanded_scores[sort_order]
 
         # Expert boundaries (compute bincount once, reuse for bias update)
@@ -145,17 +147,17 @@ class MoE(nn.Module):
         expert_ends = expert_counts.cumsum(0)
         expert_starts = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long), expert_ends[:-1]])
 
+        # Max tokens per expert for efficient grid sizing (small sync, big kernel launch savings)
+        max_expert_tokens = expert_counts.max().item()
+
         # Grouped GEMM: all experts in parallel
-        sorted_out = self.routed_experts(sorted_x, expert_starts, expert_ends)
+        sorted_out = self.routed_experts(sorted_x, expert_starts, expert_ends, max_expert_tokens)
 
-        # Apply gating scores
-        sorted_out = sorted_out * sorted_scores[:, None]
-
-        # Unsort and reshape
-        expanded_out = torch.zeros_like(sorted_out)
-        expanded_out[sort_order] = sorted_out
-        expanded_out = expanded_out.view(n_tokens, self.top_k, d)
-        routed_out = expanded_out.sum(dim=1).view(batch, seq, d)
+        # Apply gating and scatter-add directly to output (avoids expanded_out allocation)
+        weighted_out = sorted_out * sorted_scores[:, None]
+        routed_out = torch.zeros(n_tokens, d, device=x.device, dtype=weighted_out.dtype)
+        routed_out.scatter_add_(0, token_indices.unsqueeze(1).expand_as(weighted_out), weighted_out)
+        routed_out = routed_out.view(batch, seq, d)
 
         # Update bias using already-computed expert_counts
         if self.training:
@@ -182,7 +184,8 @@ class Transformer(nn.Module):
                  n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
                  n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type='rope',
                  pope_delta_init='zero', original_seq_len=None, rope_factor=1.0, beta_fast=32,
-                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True):
+                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True,
+                 use_sparse_kernel=True):
         super().__init__()
 
         # init layers
@@ -192,7 +195,7 @@ class Transformer(nn.Module):
             d_model, d_ckv, d_cq, n_heads, d_head, d_v, d_rope, max_seq_len,
             dsa_topk, local_window, n_indexer_heads, d_indexer_head, rms_eps,
             rope_base, rope_type, pope_delta_init, original_seq_len, rope_factor, beta_fast,
-            beta_slow, mscale, indexer_use_fp8, indexer_use_hadamard
+            beta_slow, mscale, indexer_use_fp8, indexer_use_hadamard, use_sparse_kernel
         )
         self.moe = MoE(n_routed, n_shared, top_k, d_model, hidden_dim, expert_scale, gamma, balance_alpha)
 
@@ -217,7 +220,8 @@ class MTPModule(nn.Module):
                  n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
                  n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type='rope',
                  pope_delta_init='zero', original_seq_len=None, rope_factor=1.0, beta_fast=32,
-                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True):
+                 beta_slow=1, mscale=1.0, indexer_use_fp8=True, indexer_use_hadamard=True,
+                 use_sparse_kernel=True):
         super().__init__()
         self.norm_h = RMSNorm(d_model, eps=rms_eps)
         self.norm_emb = RMSNorm(d_model, eps=rms_eps)
@@ -227,7 +231,7 @@ class MTPModule(nn.Module):
             n_routed, n_shared, top_k, expert_scale, gamma, balance_alpha, dsa_topk, local_window,
             n_indexer_heads, d_indexer_head, rms_eps, rope_base, rope_type, pope_delta_init,
             original_seq_len, rope_factor, beta_fast, beta_slow, mscale,
-            indexer_use_fp8, indexer_use_hadamard
+            indexer_use_fp8, indexer_use_hadamard, use_sparse_kernel
         )
 
     def forward(self, h_prev, emb_next, dsa_warmup=False, compute_aux=False):
