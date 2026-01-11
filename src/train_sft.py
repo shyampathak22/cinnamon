@@ -56,7 +56,7 @@ class SFTConfig:
     log_steps: int = 1
     checkpoint_steps: int = 500
     seed: int = 42
-    num_workers: int = 8
+    num_workers: int = 12
     pin_memory: bool = True
     use_fp8: bool = True
     gradient_checkpointing: bool = True
@@ -320,7 +320,7 @@ class SFTTrainer:
             num_workers=config.num_workers,
             pin_memory=config.pin_memory,
             persistent_workers=config.num_workers > 0,  # Keep workers alive between batches
-            prefetch_factor=4 if config.num_workers > 0 else None,  # Prefetch more batches
+            prefetch_factor=8 if config.num_workers > 0 else None,  # Prefetch more batches
             collate_fn=lambda b: collate_fn(b, pad_token_id),
             drop_last=True,
         )
@@ -334,7 +334,7 @@ class SFTTrainer:
                 num_workers=config.num_workers,
                 pin_memory=config.pin_memory,
                 persistent_workers=config.num_workers > 0,
-                prefetch_factor=4 if config.num_workers > 0 else None,
+                prefetch_factor=8 if config.num_workers > 0 else None,
                 collate_fn=lambda b: collate_fn(b, pad_token_id),
             )
 

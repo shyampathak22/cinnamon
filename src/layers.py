@@ -147,7 +147,7 @@ class MoE(nn.Module):
         expert_ends = expert_counts.cumsum(0)
         expert_starts = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long), expert_ends[:-1]])
 
-        # Max tokens per expert for efficient grid sizing (small sync, big kernel launch savings)
+        # Max tokens per expert for grid sizing (sync is worth it vs 2x over-launch)
         max_expert_tokens = expert_counts.max().item()
 
         # Grouped GEMM: all experts in parallel
