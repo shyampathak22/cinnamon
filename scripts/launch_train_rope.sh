@@ -49,6 +49,7 @@ args=(
   --checkpoint-steps "$CHECKPOINT_STEPS"
   --lr "$LR"
   --dsa-warmup-steps "$DSA_WARMUP_STEPS"
+  --d-rope 128  # 2x PoPE's d_rope=64 so D_qk matches (64+128=192 for both)
 )
 
 if [[ -n "$SEQ_LEN_FINAL" ]]; then

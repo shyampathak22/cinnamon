@@ -569,6 +569,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable-fp8', action='store_true')
     parser.add_argument('--num-workers', type=int, default=None, help="DataLoader workers")
     parser.add_argument('--prefetch-factor', type=int, default=None, help="DataLoader prefetch")
+    parser.add_argument('--d-rope', type=int, default=None, help="RoPE dimension (use 128 for RoPE to match PoPE's D_qk)")
     args = parser.parse_args()
 
     if args.load_weights_only and args.resume is None:
@@ -623,6 +624,8 @@ if __name__ == "__main__":
         model_config.beta_slow = args.beta_slow
     if args.mscale is not None:
         model_config.mscale = args.mscale
+    if args.d_rope is not None:
+        model_config.d_rope = args.d_rope
 
     if args.original_seq_len is not None:
         model_config.original_seq_len = args.original_seq_len
