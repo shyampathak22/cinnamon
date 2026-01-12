@@ -312,12 +312,13 @@ class Trainer():
         # Update FLOP calculation (dense during warmup, sparse after)
         flops_per_token = self._flops_per_token_warmup if warmup else self._flops_per_token_sparse
         self.flops_per_step = flops_per_token * self.tokens_per_step
-        for name, p in self.model.named_parameters():
-            if "indexer" in name:
-                p.requires_grad_(True)
-            else:
-                p.requires_grad_(not warmup)
-        self._set_indexer_lr(self.config.dsa_warmup_lr if warmup else self.config.lr)
+        # Joint training: both model and indexer train during warmup
+        # The only difference is dense attention (warmup) vs sparse attention (after)
+        # This allows the indexer to learn from meaningful, evolving attention patterns
+        for p in self.model.parameters():
+            p.requires_grad_(True)
+        # Use main LR for everything (indexer co-evolves with model)
+        self._set_indexer_lr(self.config.lr)
         self.optimizer.zero_grad(set_to_none=True)
 
     def _set_moe_gamma(self, gamma):
@@ -454,8 +455,7 @@ class Trainer():
                 if microstep % self.config.accumulation_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip).item()
                     self.optimizer.step()
-                    if not dsa_warmup:
-                        self.scheduler.step()
+                    self.scheduler.step()  # Always step (joint training during warmup)
                     self.optimizer.zero_grad(set_to_none=True)
                     self.step += 1
                     if self.rank == 0:
@@ -566,7 +566,6 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--weight-decay', type=float, default=None)
     parser.add_argument('--dsa-warmup-steps', type=int, default=None)
-    parser.add_argument('--dsa-warmup-lr', type=float, default=None)
     parser.add_argument('--disable-fp8', action='store_true')
     parser.add_argument('--num-workers', type=int, default=None, help="DataLoader workers")
     parser.add_argument('--prefetch-factor', type=int, default=None, help="DataLoader prefetch")
@@ -610,8 +609,6 @@ if __name__ == "__main__":
         train_config.weight_decay = args.weight_decay
     if args.dsa_warmup_steps is not None:
         train_config.dsa_warmup_steps = args.dsa_warmup_steps
-    if args.dsa_warmup_lr is not None:
-        train_config.dsa_warmup_lr = args.dsa_warmup_lr
     if args.disable_fp8:
         train_config.use_fp8 = False
     if args.num_workers is not None:

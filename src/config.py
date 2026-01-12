@@ -59,8 +59,9 @@ class TrainConfig:
     mtp_lambda_final: float = 0.1
     mtp_lambda_switch_ratio: float = 0.676  # 67.6% of training
     dsa_kl_weight: float = 1.0
+    # DSA warmup: dense attention phase where indexer learns from model's attention patterns
+    # Joint training: both model and indexer train together (not frozen model + indexer only)
     dsa_warmup_steps: int = 0
-    dsa_warmup_lr: float = 1e-3
     # Balance loss: DeepSeek V3 uses α=0.0001 (NOT 0.01!)
     moe_balance_alpha: float = 1e-4
     # Gamma schedule: γ=0.001→0.0 at 96.6% (DeepSeek V3: 14.3T/14.8T)
