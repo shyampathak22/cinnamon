@@ -732,7 +732,8 @@ if __name__ == "__main__":
             print("FP8 training enabled (SM89+ for compute benefits, otherwise storage-only)")
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    model = torch.compile(model)  # Default mode works best with DDP + MoE
+    # torch.compile disabled - B300 (sm_103a) not yet supported by Triton
+    # model = torch.compile(model)
     if rank == 0:
         print("Initializing trainer...")
     trainer = Trainer(

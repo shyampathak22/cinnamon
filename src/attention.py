@@ -234,16 +234,20 @@ class DSAIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(d_head)
         self.weights_proj = nn.Linear(d_model, n_heads, bias=False)
 
-        # Indexer positional encoding - matches main attention's rope_type
+        # Indexer positional encoding - use min(d_rope, d_head) to match indexer dimensions
+        # The indexer has smaller heads than main attention, so we can't use the full d_rope
+        indexer_rope_dim = min(d_rope, d_head)
+        self.indexer_rope_dim = indexer_rope_dim
+
         if rope_type == 'pope':
-            self.pos_enc = PoPE(d_rope, max_seq_len, rope_base, delta_init=pope_delta_init)
-            self.pos_enc_dim = d_rope * 2  # PoPE outputs cos + sin
+            self.pos_enc = PoPE(indexer_rope_dim, max_seq_len, rope_base, delta_init=pope_delta_init)
+            self.pos_enc_dim = indexer_rope_dim * 2  # PoPE outputs cos + sin
         elif rope_type == 'none':
             self.pos_enc = None  # DroPE: no positional embeddings
             self.pos_enc_dim = 0
         else:  # rope
             self.pos_enc = RoPE(
-                d_rope,
+                indexer_rope_dim,
                 max_seq_len=max_seq_len,
                 base=rope_base,
                 original_seq_len=original_seq_len,
@@ -251,7 +255,7 @@ class DSAIndexer(nn.Module):
                 beta_fast=beta_fast,
                 beta_slow=beta_slow,
             )
-            self.pos_enc_dim = d_rope  # RoPE preserves dimension
+            self.pos_enc_dim = indexer_rope_dim  # RoPE preserves dimension
 
         try:
             from kernels import quantize_fp8_rowwise
@@ -273,7 +277,7 @@ class DSAIndexer(nn.Module):
 
         # Apply positional encoding to indexer queries/keys (skip for DroPE)
         if self.pos_enc is not None:
-            rope_dim = min(self.d_rope, self.d_head)
+            rope_dim = self.indexer_rope_dim
             if rope_dim > 0:
                 q_rope, q_nope = q[..., :rope_dim], q[..., rope_dim:]
                 k_rope, k_nope = k[..., :rope_dim], k[..., rope_dim:]
