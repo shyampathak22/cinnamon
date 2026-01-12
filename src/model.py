@@ -110,20 +110,33 @@ class Cinnamon(nn.Module):
         x = emb
         dsa_kl = None
         moe_balance = None
+        moe_stats_agg = None  # Aggregated MoE stats across layers
+
         for block in self.transformer_layers:
             if self.gradient_checkpointing and self.training:
                 # Checkpoint each transformer block to save memory
-                x, attn_aux, moe_aux = checkpoint(
+                x, attn_aux, moe_aux, moe_stats = checkpoint(
                     self._run_block, block, x, dsa_warmup, compute_aux,
                     use_reentrant=False
                 )
             else:
-                x, attn_aux, moe_aux = block(x, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+                x, attn_aux, moe_aux, moe_stats = block(x, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
             if compute_aux:
                 if attn_aux is not None:
                     dsa_kl = attn_aux if dsa_kl is None else dsa_kl + attn_aux
                 if moe_aux is not None:
                     moe_balance = moe_aux if moe_balance is None else moe_balance + moe_aux
+            # Aggregate MoE stats (average across layers)
+            if moe_stats is not None:
+                if moe_stats_agg is None:
+                    moe_stats_agg = {k: v for k, v in moe_stats.items() if k != "expert_counts"}
+                    moe_stats_agg["expert_counts"] = moe_stats["expert_counts"].clone()
+                    moe_stats_agg["_count"] = 1
+                else:
+                    for k in ["load_std", "load_min", "load_max", "router_entropy"]:
+                        moe_stats_agg[k] += moe_stats[k]
+                    moe_stats_agg["expert_counts"] += moe_stats["expert_counts"]
+                    moe_stats_agg["_count"] += 1
 
         main_logits = self.lm_head(self.norm(x))
 
@@ -133,14 +146,26 @@ class Cinnamon(nn.Module):
             for depth, mtp in enumerate(self.mtp_modules, start=1):
                 h_prev = h_prev[:, :-1]
                 emb_next = emb[:, depth:]
-                h_prev, attn_aux, moe_aux = mtp(h_prev, emb_next, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+                h_prev, attn_aux, moe_aux, moe_stats = mtp(h_prev, emb_next, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
                 if compute_aux:
                     if attn_aux is not None:
                         dsa_kl = attn_aux if dsa_kl is None else dsa_kl + attn_aux
                     if moe_aux is not None:
                         moe_balance = moe_aux if moe_balance is None else moe_balance + moe_aux
+                # Aggregate MTP MoE stats too
+                if moe_stats is not None and moe_stats_agg is not None:
+                    for k in ["load_std", "load_min", "load_max", "router_entropy"]:
+                        moe_stats_agg[k] += moe_stats[k]
+                    moe_stats_agg["expert_counts"] += moe_stats["expert_counts"]
+                    moe_stats_agg["_count"] += 1
                 mtp_logits.append(self.lm_head(self.norm(h_prev)))
 
+        # Finalize aggregation (average)
+        if moe_stats_agg is not None:
+            count = moe_stats_agg.pop("_count")
+            for k in ["load_std", "load_min", "load_max", "router_entropy"]:
+                moe_stats_agg[k] /= count
+
         if compute_aux:
-            return main_logits, mtp_logits, dsa_kl, moe_balance
+            return main_logits, mtp_logits, dsa_kl, moe_balance, moe_stats_agg
         return main_logits, mtp_logits

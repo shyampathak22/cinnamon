@@ -344,7 +344,7 @@ class Trainer():
         dsa_warmup = self.step < self.config.dsa_warmup_steps
 
         with autocast('cuda', dtype=torch.bfloat16):
-            main_logits, mtp_logits, dsa_kl, moe_balance = self.model(
+            main_logits, mtp_logits, dsa_kl, moe_balance, moe_stats = self.model(
                 x, dsa_warmup=dsa_warmup, compute_aux=True
             )
             # NaN detection
@@ -375,7 +375,7 @@ class Trainer():
 
         # BF16 doesn't need GradScaler - direct backward
         loss.backward()
-        return loss * self.config.accumulation_steps, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda
+        return loss * self.config.accumulation_steps, mtp_loss, main_loss, dsa_kl, moe_balance, moe_stats, aux_loss_value, mtp_lambda
 
     @torch.no_grad()
     def val_step(self, batch):
@@ -443,7 +443,7 @@ class Trainer():
                 is_last_accum = (microstep + 1) % self.config.accumulation_steps == 0
                 sync_context = contextlib.nullcontext() if is_last_accum else self.model.no_sync()
                 with sync_context:
-                    loss, mtp_loss, main_loss, dsa_kl, moe_balance, aux_loss_value, mtp_lambda = self.train_step(batch)
+                    loss, mtp_loss, main_loss, dsa_kl, moe_balance, moe_stats, aux_loss_value, mtp_lambda = self.train_step(batch)
                 end_t = time.perf_counter()
                 accum_time += (end_t - start_t)
                 microstep += 1
@@ -486,7 +486,7 @@ class Trainer():
                                     lr_main = group.get("lr")
                                 if group.get("group") == "indexer" and lr_indexer is None:
                                     lr_indexer = group.get("lr")
-                            wandb.log({
+                            log_dict = {
                                 "train/loss": loss.item(),
                                 "train/aux_loss": aux_loss_value,
                                 "train/mtp_lambda": mtp_lambda,
@@ -504,7 +504,20 @@ class Trainer():
                                 "train/seq_len": self.config.seq_len,
                                 "train/lr_main": lr_main,
                                 "train/lr_indexer": lr_indexer,
-                            })
+                            }
+                            # Add MoE utilization stats
+                            if moe_stats is not None:
+                                log_dict.update({
+                                    "moe/load_std": moe_stats["load_std"],
+                                    "moe/load_min": moe_stats["load_min"],
+                                    "moe/load_max": moe_stats["load_max"],
+                                    "moe/router_entropy": moe_stats["router_entropy"],
+                                })
+                                # Log expert load histogram every 100 steps
+                                if self.step % 100 == 0:
+                                    expert_counts = moe_stats["expert_counts"].cpu().numpy()
+                                    log_dict["moe/expert_loads"] = wandb.Histogram(expert_counts)
+                            wandb.log(log_dict)
                     if self.step % self.config.eval_steps == 0 and self.step > 0:
                         self.model.eval()
                         eval_loss, eval_main_loss, eval_mtp_loss = self.val()

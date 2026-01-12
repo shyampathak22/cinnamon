@@ -176,7 +176,26 @@ class MoE(nn.Module):
 
             balance_loss = self.balance_alpha * (f_i * p_i).sum(dim=-1).mean()
 
-        return shared_out + routed_out, balance_loss
+        # Expert utilization stats (computed during training for monitoring)
+        moe_stats = None
+        if self.training:
+            with torch.no_grad():
+                # Normalize expert counts to fractions
+                expert_fracs = expert_counts.float() / expert_counts.sum()
+                # Router entropy: higher = more exploration
+                router_probs = scores.mean(dim=(0, 1))  # avg routing probs per expert
+                router_probs = router_probs / (router_probs.sum() + 1e-9)
+                router_entropy = -(router_probs * (router_probs + 1e-9).log()).sum()
+
+                moe_stats = {
+                    "load_std": expert_fracs.std().item(),
+                    "load_min": expert_fracs.min().item(),
+                    "load_max": expert_fracs.max().item(),
+                    "router_entropy": router_entropy.item(),
+                    "expert_counts": expert_counts.detach(),  # for histogram
+                }
+
+        return shared_out + routed_out, balance_loss, moe_stats
 
 class Transformer(nn.Module):
 
@@ -206,11 +225,11 @@ class Transformer(nn.Module):
         # pass norms to MHA and add to residual stream
         attn_out, attn_aux = self.attn(normx, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
         x = x + attn_out
-        
+
         # pass norms to SwiGLU and add to residual stream
-        moe_out, moe_aux = self.moe(self.rms2(x))
+        moe_out, moe_balance, moe_stats = self.moe(self.rms2(x))
         x = x + moe_out
-        return x, attn_aux, moe_aux
+        return x, attn_aux, moe_balance, moe_stats
     
 class MTPModule(nn.Module):
     """
@@ -238,4 +257,5 @@ class MTPModule(nn.Module):
         h = self.norm_h(h_prev)
         e = self.norm_emb(emb_next)
         h_proj = self.proj(torch.cat((h, e), dim=-1))
-        return self.block(h_proj, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+        x, attn_aux, moe_balance, moe_stats = self.block(h_proj, dsa_warmup=dsa_warmup, compute_aux=compute_aux)
+        return x, attn_aux, moe_balance, moe_stats

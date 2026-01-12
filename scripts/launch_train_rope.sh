@@ -21,9 +21,9 @@ MAX_TOKENS="${MAX_TOKENS:-25000000000}"
 SEQ_LEN="${SEQ_LEN:-512}"
 SEQ_LEN_FINAL="${SEQ_LEN_FINAL:-1024}"
 
-# DSA warmup: ~0.22% of training (DeepSeek V3.2 ratio)
-# 55M tokens / (24 * 1 * 512) = ~4500 steps for 2 GPUs
-DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1750}"
+# DSA warmup: ~1% of training (conservative for from-scratch joint training)
+# 245M tokens / (24 * 1 * 512 * 2 GPUs) = ~10k steps
+DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-10000}"
 
 BATCH_SIZE="${BATCH_SIZE:-24}"  # Divides by 12 to 2 when seq_len switches to 1024
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"  # Multiplies by 8 to 8 when seq_len switches
