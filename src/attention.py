@@ -238,7 +238,10 @@ class DSAIndexer(nn.Module):
         if rope_type == 'pope':
             self.pos_enc = PoPE(d_rope, max_seq_len, rope_base, delta_init=pope_delta_init)
             self.pos_enc_dim = d_rope * 2  # PoPE outputs cos + sin
-        else:
+        elif rope_type == 'none':
+            self.pos_enc = None  # DroPE: no positional embeddings
+            self.pos_enc_dim = 0
+        else:  # rope
             self.pos_enc = RoPE(
                 d_rope,
                 max_seq_len=max_seq_len,
@@ -268,16 +271,17 @@ class DSAIndexer(nn.Module):
         q = self.w_q(q_latent).view(bsz, seqlen, self.n_heads, self.d_head)
         k = self.k_norm(self.w_k(x))
 
-        # Apply positional encoding to indexer queries/keys
-        rope_dim = min(self.d_rope, self.d_head)
-        if rope_dim > 0:
-            q_rope, q_nope = q[..., :rope_dim], q[..., rope_dim:]
-            k_rope, k_nope = k[..., :rope_dim], k[..., rope_dim:]
-            # For PoPE: queries don't get delta, keys do
-            q_rope = self._apply_pos_enc(q_rope, positions=None, apply_delta=False)
-            k_rope = self._apply_pos_enc(k_rope.unsqueeze(2), positions=None, apply_delta=True).squeeze(2)
-            q = torch.cat([q_rope, q_nope], dim=-1)
-            k = torch.cat([k_rope, k_nope], dim=-1)
+        # Apply positional encoding to indexer queries/keys (skip for DroPE)
+        if self.pos_enc is not None:
+            rope_dim = min(self.d_rope, self.d_head)
+            if rope_dim > 0:
+                q_rope, q_nope = q[..., :rope_dim], q[..., rope_dim:]
+                k_rope, k_nope = k[..., :rope_dim], k[..., rope_dim:]
+                # For PoPE: queries don't get delta, keys do
+                q_rope = self._apply_pos_enc(q_rope, positions=None, apply_delta=False)
+                k_rope = self._apply_pos_enc(k_rope.unsqueeze(2), positions=None, apply_delta=True).squeeze(2)
+                q = torch.cat([q_rope, q_nope], dim=-1)
+                k = torch.cat([k_rope, k_nope], dim=-1)
 
         if self.use_hadamard:
             q = hadamard_transform(q)
@@ -324,7 +328,7 @@ class MultiheadLatentAttention(nn.Module):
         self.d_head = d_head
         self.d_v = d_v
         self.d_rope = d_rope
-        self.rope_dim = d_rope * (2 if rope_type == 'pope' else 1)
+        self.rope_dim = 0 if rope_type == 'none' else d_rope * (2 if rope_type == 'pope' else 1)
         self.rope_type = rope_type
         self.dsa_topk = dsa_topk
         self.local_window = local_window
@@ -342,12 +346,19 @@ class MultiheadLatentAttention(nn.Module):
         self.w_uq = nn.Linear(d_cq, d_head * n_head, bias=False)
 
         # Decoupled positional projections (with normalization for PoPE stability)
-        self.w_qr = nn.Linear(d_cq, d_rope * n_head, bias=False)
-        self.w_kr = nn.Linear(d_model, d_rope, bias=False)
-        self.qr_norm = RMSNorm(d_rope * n_head, eps=rms_eps)
-        self.kr_norm = RMSNorm(d_rope, eps=rms_eps)
+        # These are None when rope_type='none' (DroPE - no positional embeddings)
+        if rope_type != 'none':
+            self.w_qr = nn.Linear(d_cq, d_rope * n_head, bias=False)
+            self.w_kr = nn.Linear(d_model, d_rope, bias=False)
+            self.qr_norm = RMSNorm(d_rope * n_head, eps=rms_eps)
+            self.kr_norm = RMSNorm(d_rope, eps=rms_eps)
+        else:
+            self.w_qr = None
+            self.w_kr = None
+            self.qr_norm = None
+            self.kr_norm = None
 
-        # Positional encoding: RoPE (default) or PoPE
+        # Positional encoding: RoPE, PoPE, or None (DroPE)
         if rope_type == 'rope':
             self.pos_enc = RoPE(
                 d_rope,
@@ -360,8 +371,10 @@ class MultiheadLatentAttention(nn.Module):
             )
         elif rope_type == 'pope':
             self.pos_enc = PoPE(d_rope, max_seq_len, rope_base, delta_init=pope_delta_init)
+        elif rope_type == 'none':
+            self.pos_enc = None  # DroPE: no positional embeddings
         else:
-            raise ValueError(f"Unknown rope_type: {rope_type}. Use 'rope' or 'pope'.")
+            raise ValueError(f"Unknown rope_type: {rope_type}. Use 'rope', 'pope', or 'none'.")
 
         self.w_out = nn.Linear(d_v * n_head, d_model, bias=False)
         self.indexer = DSAIndexer(
@@ -428,26 +441,31 @@ class MultiheadLatentAttention(nn.Module):
 
         # Query projections (same for both paths)
         query_c = self.w_uq(c_q).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
-        q_rope_input = self.qr_norm(self.w_qr(c_q)).view(batch_size, seq_len, self.n_head, self.d_rope)
-
-        if self.rope_type == 'rope':
-            query_r = self.pos_enc(q_rope_input, interleaved=True).transpose(1, 2)
-        else:
-            query_r = self.pos_enc(q_rope_input, apply_delta=False).transpose(1, 2)
 
         # Key/value projections - same for both dense warmup and sparse (memory-efficient!)
         # Keys/values are [B, H, L, D] - no expansion to [B, H, L, K, D]
         key_c = self.w_uk(c_kv).view(batch_size, seq_len, self.n_head, self.d_head).transpose(1, 2)
         value = self.w_uv(c_kv).view(batch_size, seq_len, self.n_head, self.d_v).transpose(1, 2)
-        k_rope_input = self.kr_norm(self.w_kr(x)).unsqueeze(2)
-        if self.rope_type == 'rope':
-            key_r = self.pos_enc(k_rope_input, interleaved=True).squeeze(2)
-        else:
-            key_r = self.pos_enc(k_rope_input, apply_delta=True).squeeze(2)
-        key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1)
 
-        query = torch.cat((query_c, query_r), dim=-1)
-        key = torch.cat((key_c, key_r), dim=-1)
+        # Positional components (skip for rope_type='none' / DroPE)
+        if self.rope_type == 'none':
+            # DroPE: content-only attention, no positional embeddings
+            query = query_c
+            key = key_c
+        else:
+            q_rope_input = self.qr_norm(self.w_qr(c_q)).view(batch_size, seq_len, self.n_head, self.d_rope)
+            k_rope_input = self.kr_norm(self.w_kr(x)).unsqueeze(2)
+
+            if self.rope_type == 'rope':
+                query_r = self.pos_enc(q_rope_input, interleaved=True).transpose(1, 2)
+                key_r = self.pos_enc(k_rope_input, interleaved=True).squeeze(2)
+            else:  # pope
+                query_r = self.pos_enc(q_rope_input, apply_delta=False).transpose(1, 2)
+                key_r = self.pos_enc(k_rope_input, apply_delta=True).squeeze(2)
+            key_r = key_r.unsqueeze(1).expand(-1, self.n_head, -1, -1)
+
+            query = torch.cat((query_c, query_r), dim=-1)
+            key = torch.cat((key_c, key_r), dim=-1)
 
         scale = self.softmax_scale
 

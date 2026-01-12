@@ -545,6 +545,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--rope', action='store_true', help='Use standard RoPE (default)')
     group.add_argument('--pope', action='store_true', help='Use Polar Position Embedding')
+    group.add_argument('--none', action='store_true', dest='no_pe', help='No positional embeddings (DroPE)')
     parser.add_argument('--run-name', type=str, default=None)
     parser.add_argument('--wandb-project', type=str, default='cinnamon')
     parser.add_argument('--resume', type=Path, default=None, help="Path to checkpoint to resume")
@@ -578,6 +579,8 @@ if __name__ == "__main__":
     # Determine rope_type from CLI args
     if args.pope:
         rope_type = 'pope'
+    elif args.no_pe:
+        rope_type = 'none'
     else:
         rope_type = 'rope'  # Default
 
