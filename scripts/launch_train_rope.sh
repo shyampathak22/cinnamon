@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
+# RoPE training script (~200M params, 25B tokens)
+# Phase 1: DSA warmup at SEQ_LEN=512, indexer trains (model frozen)
+# Phase 2: Full training at SEQ_LEN_FINAL=1024
 set -euo pipefail
 
 PROJECT="${WANDB_PROJECT:-cinnamon}"
 RUN_PREFIX="${RUN_PREFIX:-}"
-BASE_NAME="rope-d_rope64"
+BASE_NAME="rope-200M"
 if [[ -n "$RUN_PREFIX" ]]; then
   RUN_NAME="${RUN_PREFIX}-${BASE_NAME}"
 else
   RUN_NAME="${RUN_NAME:-$BASE_NAME}"
 fi
 
-MAX_TOKENS="${MAX_TOKENS:-250000000}"
+# 25B tokens
+MAX_TOKENS="${MAX_TOKENS:-25000000000}"
+
+# Phase 1: DSA warmup at 512 seq len
+# Phase 2: switches to 1024
 SEQ_LEN="${SEQ_LEN:-512}"
 SEQ_LEN_FINAL="${SEQ_LEN_FINAL:-1024}"
-DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-100}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-16}"
-EVAL_STEPS="${EVAL_STEPS:-100}"
-CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-500}"
-LR="${LR:-6e-4}"
+
+# DSA warmup: ~0.22% of training (DeepSeek V3.2 ratio)
+# 55M tokens / (24 * 1 * 512) = ~4500 steps for 2 GPUs
+DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1750}"
+
+BATCH_SIZE="${BATCH_SIZE:-24}"  # Divides by 12 to 2 when seq_len switches to 1024
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"  # Multiplies by 8 to 8 when seq_len switches
+EVAL_STEPS="${EVAL_STEPS:-500}"
+CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-500}"  # Aggressive for spot instance
+LR="${LR:-3e-4}"
+
+# GPU config - default to GPUs 0,1 for RoPE
+NUM_GPUS="${NUM_GPUS:-2}"
+CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 
 args=(
   --rope
@@ -27,7 +43,6 @@ args=(
   --max-tokens "$MAX_TOKENS"
   --seq-len "$SEQ_LEN"
   --max-seq-len "$SEQ_LEN"
-  --rope-factor 1.0
   --batch-size "$BATCH_SIZE"
   --accumulation-steps "$ACCUMULATION_STEPS"
   --eval-steps "$EVAL_STEPS"
@@ -40,4 +55,7 @@ if [[ -n "$SEQ_LEN_FINAL" ]]; then
   args+=(--seq-len-final "$SEQ_LEN_FINAL" --max-seq-len "$SEQ_LEN_FINAL")
 fi
 
-uv run torchrun --nproc_per_node=1 --master_port=29500 src/train.py "${args[@]}" "$@"
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" uv run torchrun \
+  --nproc_per_node="$NUM_GPUS" \
+  --master_port="$MASTER_PORT" \
+  src/train.py "${args[@]}" "$@"

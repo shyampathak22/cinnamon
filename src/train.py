@@ -246,6 +246,7 @@ class Trainer():
             num_workers=self.config.num_workers,
             pin_memory=self.config.pin_memory,
             prefetch_factor=self.config.prefetch_factor if self.config.num_workers > 0 else None,
+            persistent_workers=self.config.num_workers > 0,  # keep workers alive between epochs
         )
 
     def _set_seq_len(self, seq_len):
@@ -566,6 +567,8 @@ if __name__ == "__main__":
     parser.add_argument('--dsa-warmup-steps', type=int, default=None)
     parser.add_argument('--dsa-warmup-lr', type=float, default=None)
     parser.add_argument('--disable-fp8', action='store_true')
+    parser.add_argument('--num-workers', type=int, default=None, help="DataLoader workers")
+    parser.add_argument('--prefetch-factor', type=int, default=None, help="DataLoader prefetch")
     args = parser.parse_args()
 
     if args.load_weights_only and args.resume is None:
@@ -607,6 +610,10 @@ if __name__ == "__main__":
         train_config.dsa_warmup_lr = args.dsa_warmup_lr
     if args.disable_fp8:
         train_config.use_fp8 = False
+    if args.num_workers is not None:
+        train_config.num_workers = args.num_workers
+    if args.prefetch_factor is not None:
+        train_config.prefetch_factor = args.prefetch_factor
 
     if args.rope_factor is not None:
         model_config.rope_factor = args.rope_factor

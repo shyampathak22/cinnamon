@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PoPE training script (~202M params, 10B tokens)
+# PoPE training script (~200M params, 25B tokens)
 # Phase 1: DSA warmup at SEQ_LEN=512, indexer trains (model frozen)
 # Phase 2: Full training at SEQ_LEN_FINAL=1024
 set -euo pipefail
@@ -13,26 +13,28 @@ else
   RUN_NAME="${RUN_NAME:-$BASE_NAME}"
 fi
 
-# 10B tokens (DeepSeek V3 ratios for MTP/gamma switches in config.py)
-MAX_TOKENS="${MAX_TOKENS:-10000000000}"
+# 25B tokens
+MAX_TOKENS="${MAX_TOKENS:-25000000000}"
 
 # Phase 1: DSA warmup at 512 seq len
 # Phase 2: switches to 1024
 SEQ_LEN="${SEQ_LEN:-512}"
 SEQ_LEN_FINAL="${SEQ_LEN_FINAL:-1024}"
 
-# DSA warmup: ~0.22% of training (DeepSeek V3.2 ratio: 2.1B/946B)
-# 22M tokens / (2 * 32 * 512) = ~671 steps
-DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-700}"
+# DSA warmup: ~0.22% of training (DeepSeek V3.2 ratio)
+# 55M tokens / (24 * 1 * 512) = ~4500 steps for 2 GPUs
+DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1750}"
 
-BATCH_SIZE="${BATCH_SIZE:-24}"  # Divides by 12 to 2 when seq_len switches to 1024 (sparse kernel)
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"  # Multiplies by 8 to 8 when seq_len switches to 1024
-EVAL_STEPS="${EVAL_STEPS:-200}"
-CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-10000}"
+BATCH_SIZE="${BATCH_SIZE:-24}"  # Divides by 12 to 2 when seq_len switches to 1024
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"  # Multiplies by 8 to 8 when seq_len switches
+EVAL_STEPS="${EVAL_STEPS:-500}"
+CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-500}"  # Aggressive for spot instance
 LR="${LR:-3e-4}"
 
-# Number of GPUs
+# GPU config - default to GPUs 2,3 for PoPE
 NUM_GPUS="${NUM_GPUS:-2}"
+CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 args=(
   --pope
@@ -53,4 +55,7 @@ if [[ -n "$SEQ_LEN_FINAL" ]]; then
   args+=(--seq-len-final "$SEQ_LEN_FINAL" --max-seq-len "$SEQ_LEN_FINAL")
 fi
 
-uv run torchrun --nproc_per_node="$NUM_GPUS" --master_port=29501 src/train.py "${args[@]}" "$@"
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" uv run torchrun \
+  --nproc_per_node="$NUM_GPUS" \
+  --master_port="$MASTER_PORT" \
+  src/train.py "${args[@]}" "$@"

@@ -40,24 +40,24 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    # Scaled for 10B tokens, ~200M params (DeepSeek V3 ratios)
+    # Scaled for 25B tokens, ~200M params (DeepSeek V3 ratios)
     lr: float = 3e-4  # restored after adding RoPE projection norms
-    max_tokens: int = 10_000_000_000  # 10B tokens
+    max_tokens: int = 25_000_000_000  # 25B tokens
     batch_size: int = 2
     accumulation_steps: int = 32  # effective batch = 2*32*1024 = 65k tokens/step
     seq_len: int = 1024  # training context length (align with ModelConfig)
     seq_len_final: int | None = None  # optional post-warmup seq len
     grad_clip: float = 1.0  # DeepSeek V3: 1.0
     weight_decay: float = 0.1  # DeepSeek V3: 0.1
-    eval_steps: int = 200
+    eval_steps: int = 500
     log_steps: int = 10
-    checkpoint_steps: int = 1000
+    checkpoint_steps: int = 500  # aggressive for spot instances
     seed: int = 42
-    peak_flops: float = 23.7e12
+    peak_flops: float = 2250e12  # B300: ~2.25 PFLOPS FP8
     # MTP schedule: λ=0.3→0.1 at 67.6% (DeepSeek V3: 10T/14.8T)
     mtp_lambda: float = 0.3
     mtp_lambda_final: float = 0.1
-    mtp_lambda_switch_tokens: int = 6_760_000_000  # 67.6% of 10B
+    mtp_lambda_switch_ratio: float = 0.676  # 67.6% of training
     dsa_kl_weight: float = 1.0
     dsa_warmup_steps: int = 0
     dsa_warmup_lr: float = 1e-3
@@ -65,11 +65,11 @@ class TrainConfig:
     moe_balance_alpha: float = 1e-4
     # Gamma schedule: γ=0.001→0.0 at 96.6% (DeepSeek V3: 14.3T/14.8T)
     gamma_final: float = 0.0
-    gamma_switch_tokens: int = 9_660_000_000  # 96.6% of 10B
-    # DataLoader settings
-    num_workers: int = 4
+    gamma_switch_ratio: float = 0.966  # 96.6% of training
+    # DataLoader settings (tuned for 120 CPU B300 box)
+    num_workers: int = 32  # ~1/4 of CPUs, leave room for other processes
     pin_memory: bool = True
-    prefetch_factor: int = 2
+    prefetch_factor: int = 8  # aggressive prefetch for large batches
     # FP8 training (requires SM89+ for compute benefits, otherwise storage-only)
     use_fp8: bool = True  # DeepSeek V3 style block-wise FP8
     @property
@@ -78,3 +78,9 @@ class TrainConfig:
     @property
     def warmup_steps(self):
         return self.max_steps // 10
+    @property
+    def mtp_lambda_switch_tokens(self):
+        return int(self.max_tokens * self.mtp_lambda_switch_ratio)
+    @property
+    def gamma_switch_tokens(self):
+        return int(self.max_tokens * self.gamma_switch_ratio)
