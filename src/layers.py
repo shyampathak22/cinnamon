@@ -6,10 +6,12 @@ from attention import MultiheadLatentAttention
 
 # Try to import grouped GEMM kernel
 try:
-    from kernels import moe_grouped_gemm
+    from kernels import moe_grouped_gemm, triton_available
+    # Only use grouped GEMM if Triton supports this GPU (e.g., not Blackwell sm_103a)
     HAS_GROUPED_GEMM = True
 except ImportError:
     HAS_GROUPED_GEMM = False
+    triton_available = lambda: False
 
 
 class SwiGLU(nn.Module):
@@ -66,7 +68,7 @@ class GroupedExperts(nn.Module):
         Returns:
             (total_tokens, d_model) - output
         """
-        if HAS_GROUPED_GEMM and sorted_x.is_cuda:
+        if HAS_GROUPED_GEMM and sorted_x.is_cuda and triton_available():
             # Fused up-projection: one GEMM instead of two
             h12 = moe_grouped_gemm(sorted_x, self.w12, expert_starts, expert_ends, max_expert_tokens)
             h1, h2 = h12.float().chunk(2, dim=-1)
@@ -74,7 +76,7 @@ class GroupedExperts(nn.Module):
             out = moe_grouped_gemm(h.to(sorted_x.dtype), self.w3, expert_starts, expert_ends, max_expert_tokens)
             return out.float()
         else:
-            # Fallback: sequential expert processing (GPU without kernel or CPU)
+            # Fallback: sequential expert processing (GPU without Triton support or CPU)
             out = torch.zeros(sorted_x.size(0), self.d_model, device=sorted_x.device, dtype=sorted_x.dtype)
             for i in range(self.n_experts):
                 start, end = expert_starts[i].item(), expert_ends[i].item()

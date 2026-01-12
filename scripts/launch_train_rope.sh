@@ -4,6 +4,9 @@
 # Phase 2: Full training at SEQ_LEN_FINAL=1024
 set -euo pipefail
 
+# Use system ptxas for Triton (required for Blackwell B300 sm_103a support)
+export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
+
 PROJECT="${WANDB_PROJECT:-cinnamon}"
 RUN_PREFIX="${RUN_PREFIX:-}"
 BASE_NAME="rope-200M"

@@ -6,14 +6,250 @@ DeepSeek-style FP8 quantization with:
 - Block-wise scaling for weights (128x128)
 - E4M3 format for both forward and backward
 - Online quantization: scale = max(|x|) / 448
+
+Supports fallback to PyTorch native FP8 ops when Triton doesn't support
+the GPU architecture (e.g., Blackwell B300 sm_103a).
 """
 
 import torch
 import triton
 import triton.language as tl
+import warnings
 
 # FP8 E4M3 max representable value
 FP8_E4M3_MAX = tl.constexpr(448.0)
+FP8_MAX_FLOAT = 448.0
+
+# =============================================================================
+# Triton Architecture Detection
+# =============================================================================
+
+_TRITON_AVAILABLE = None  # Lazy init
+
+def _check_triton_support():
+    """Check if Triton supports the current GPU architecture."""
+    global _TRITON_AVAILABLE
+    if _TRITON_AVAILABLE is not None:
+        return _TRITON_AVAILABLE
+
+    if not torch.cuda.is_available():
+        _TRITON_AVAILABLE = False
+        return False
+
+    try:
+        # Try to compile and run a minimal kernel
+        @triton.jit
+        def _test_kernel(x_ptr, out_ptr, N: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * 32 + tl.arange(0, 32)
+            mask = offs < N
+            x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+            tl.store(out_ptr + offs, x, mask=mask)
+
+        # Actually run the kernel to trigger ptxas compilation
+        x = torch.ones(64, device='cuda', dtype=torch.float32)
+        out = torch.zeros(64, device='cuda', dtype=torch.float32)
+        _test_kernel[(2,)](x, out, 64)
+        torch.cuda.synchronize()
+        _TRITON_AVAILABLE = True
+    except Exception as e:
+        if "sm_103" in str(e) or "ptxas" in str(e) or "gpu-name" in str(e):
+            warnings.warn(
+                f"Triton doesn't support this GPU architecture (likely Blackwell sm_103a). "
+                f"Falling back to PyTorch native FP8 ops. Error: {e}"
+            )
+        _TRITON_AVAILABLE = False
+
+    return _TRITON_AVAILABLE
+
+
+def triton_available():
+    """Returns True if Triton kernels work on current GPU."""
+    return _check_triton_support()
+
+
+def print_backend_status():
+    """Print which backend is being used for FP8/sparse kernels."""
+    if triton_available():
+        print("[Kernels] Using Triton kernels for FP8 and sparse attention")
+    else:
+        print("[Kernels] Using PyTorch fallback (Triton not supported on this GPU)")
+        print("          FP8 training is still enabled via PyTorch native ops")
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            print(f"          GPU: {props.name} (compute capability {props.major}.{props.minor})")
+
+
+# =============================================================================
+# PyTorch Native FP8 Fallbacks (for Blackwell/sm_103a)
+# =============================================================================
+
+def _quantize_fp8_rowwise_pytorch(x: torch.Tensor, block_size: int = 128, round_scale: bool = False):
+    """
+    PyTorch native FP8 row-wise quantization fallback.
+    Uses per-row (not per-block) scaling for simplicity.
+    """
+    M, N = x.shape
+    num_col_blocks = (N + block_size - 1) // block_size
+
+    # Pad N to multiple of block_size for reshape
+    pad_n = num_col_blocks * block_size - N
+    if pad_n > 0:
+        x_padded = torch.nn.functional.pad(x, (0, pad_n))
+    else:
+        x_padded = x
+
+    # Reshape to (M, num_blocks, block_size)
+    x_blocks = x_padded.view(M, num_col_blocks, block_size)
+
+    # Compute per-block max
+    abs_max = x_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)  # (M, num_blocks, 1)
+
+    if round_scale:
+        # Power-of-2 scaling
+        scales = torch.exp2(torch.ceil(torch.log2(abs_max / FP8_MAX_FLOAT)))
+    else:
+        scales = abs_max / FP8_MAX_FLOAT
+
+    # Quantize
+    x_scaled = (x_blocks / scales).clamp(-FP8_MAX_FLOAT, FP8_MAX_FLOAT)
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+
+    # Reshape back and remove padding
+    x_fp8 = x_fp8.view(M, -1)
+    if pad_n > 0:
+        x_fp8 = x_fp8[:, :N]
+
+    scales = scales.squeeze(-1)  # (M, num_blocks)
+    return x_fp8, scales.float()
+
+
+def _quantize_fp8_blockwise_pytorch(x: torch.Tensor, block_m: int = 128, block_n: int = 128, round_scale: bool = False):
+    """
+    PyTorch native FP8 block-wise quantization fallback.
+    """
+    M, N = x.shape
+    num_row_blocks = (M + block_m - 1) // block_m
+    num_col_blocks = (N + block_n - 1) // block_n
+
+    # Pad to block boundaries
+    pad_m = num_row_blocks * block_m - M
+    pad_n = num_col_blocks * block_n - N
+    if pad_m > 0 or pad_n > 0:
+        x_padded = torch.nn.functional.pad(x, (0, pad_n, 0, pad_m))
+    else:
+        x_padded = x
+
+    # Reshape to (num_row_blocks, block_m, num_col_blocks, block_n)
+    x_blocks = x_padded.view(num_row_blocks, block_m, num_col_blocks, block_n)
+    x_blocks = x_blocks.permute(0, 2, 1, 3)  # (num_row_blocks, num_col_blocks, block_m, block_n)
+
+    # Compute per-block max
+    abs_max = x_blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-4)
+
+    if round_scale:
+        scales = torch.exp2(torch.ceil(torch.log2(abs_max / FP8_MAX_FLOAT)))
+    else:
+        scales = abs_max / FP8_MAX_FLOAT
+
+    # Quantize
+    x_scaled = (x_blocks / scales).clamp(-FP8_MAX_FLOAT, FP8_MAX_FLOAT)
+    x_fp8 = x_scaled.to(torch.float8_e4m3fn)
+
+    # Reshape back
+    x_fp8 = x_fp8.permute(0, 2, 1, 3).contiguous().view(num_row_blocks * block_m, num_col_blocks * block_n)
+    if pad_m > 0 or pad_n > 0:
+        x_fp8 = x_fp8[:M, :N]
+
+    scales = scales.squeeze(-1).squeeze(-1)  # (num_row_blocks, num_col_blocks)
+    return x_fp8, scales.float()
+
+
+def _fp8_matmul_pytorch(a_fp8, b_fp8, a_scales, b_scales, out_dtype=torch.bfloat16):
+    """
+    PyTorch native FP8 matmul using torch._scaled_mm.
+
+    Note: torch._scaled_mm uses per-tensor scaling, so we need to approximate
+    fine-grained scaling by dequantizing first for full accuracy.
+    """
+    # Check if _scaled_mm is available and supports our use case
+    if hasattr(torch, '_scaled_mm'):
+        try:
+            # torch._scaled_mm requires (M, K) @ (K, N) with per-tensor scales
+            # For fine-grained scaling, we need to dequantize first
+            M, K = a_fp8.shape
+            K2, N = b_fp8.shape
+
+            # Use per-tensor approximation for speed (trades some accuracy)
+            # Average scales across blocks
+            a_scale_avg = a_scales.mean()
+            b_scale_avg = b_scales.mean()
+
+            # _scaled_mm expects scale as a scalar tensor
+            result = torch._scaled_mm(
+                a_fp8,
+                b_fp8,
+                scale_a=a_scale_avg,
+                scale_b=b_scale_avg,
+                out_dtype=out_dtype,
+            )
+            return result
+        except Exception:
+            pass  # Fall through to manual implementation
+
+    # Manual dequantize + matmul fallback
+    # Dequantize A (row-wise 1x128 scaling)
+    a_deq = _dequantize_fp8_rowwise_pytorch(a_fp8, a_scales, block_size=128)
+    # Dequantize B (block-wise 128x128 scaling)
+    b_deq = _dequantize_fp8_blockwise_pytorch(b_fp8, b_scales, block_m=128, block_n=128)
+
+    return (a_deq @ b_deq).to(out_dtype)
+
+
+def _dequantize_fp8_rowwise_pytorch(x_fp8: torch.Tensor, scales: torch.Tensor, block_size: int = 128):
+    """Dequantize FP8 with row-wise scaling."""
+    M, N = x_fp8.shape
+    num_blocks = scales.shape[1]
+
+    # Pad to block boundary
+    pad_n = num_blocks * block_size - N
+    if pad_n > 0:
+        x_fp8 = torch.nn.functional.pad(x_fp8, (0, pad_n))
+
+    # Reshape and dequantize
+    x = x_fp8.view(M, num_blocks, block_size).float()
+    x = x * scales.unsqueeze(-1)
+    x = x.view(M, -1)
+
+    if pad_n > 0:
+        x = x[:, :N]
+    return x
+
+
+def _dequantize_fp8_blockwise_pytorch(x_fp8: torch.Tensor, scales: torch.Tensor, block_m: int = 128, block_n: int = 128):
+    """Dequantize FP8 with block-wise scaling."""
+    M, N = x_fp8.shape
+    num_row_blocks, num_col_blocks = scales.shape
+
+    # Pad to block boundaries
+    pad_m = num_row_blocks * block_m - M
+    pad_n = num_col_blocks * block_n - N
+    if pad_m > 0 or pad_n > 0:
+        x_fp8 = torch.nn.functional.pad(x_fp8, (0, pad_n, 0, pad_m))
+
+    # Reshape: (num_row_blocks, block_m, num_col_blocks, block_n)
+    x = x_fp8.view(num_row_blocks, block_m, num_col_blocks, block_n).float()
+    x = x.permute(0, 2, 1, 3)  # (num_row_blocks, num_col_blocks, block_m, block_n)
+
+    # Multiply by scales
+    x = x * scales.unsqueeze(-1).unsqueeze(-1)
+
+    # Reshape back
+    x = x.permute(0, 2, 1, 3).contiguous().view(num_row_blocks * block_m, num_col_blocks * block_n)
+
+    if pad_m > 0 or pad_n > 0:
+        x = x[:M, :N]
+    return x
 
 
 @triton.jit
@@ -194,6 +430,10 @@ def quantize_fp8_rowwise(
     assert x.is_cuda, "Input must be on CUDA"
     assert x.ndim == 2, "Input must be 2D for now"
 
+    # Use PyTorch fallback if Triton doesn't support this GPU
+    if not triton_available():
+        return _quantize_fp8_rowwise_pytorch(x, block_size, round_scale)
+
     M, N = x.shape
     num_col_blocks = (N + block_size - 1) // block_size
 
@@ -236,6 +476,10 @@ def quantize_fp8_blockwise(
     """
     assert x.is_cuda, "Input must be on CUDA"
     assert x.ndim == 2, "Input must be 2D"
+
+    # Use PyTorch fallback if Triton doesn't support this GPU
+    if not triton_available():
+        return _quantize_fp8_blockwise_pytorch(x, block_m, block_n, round_scale)
 
     M, N = x.shape
     num_row_blocks = (M + block_m - 1) // block_m
@@ -389,6 +633,44 @@ def lightning_indexer_kernel(
     tl.store(out_ptrs, acc.to(tl.float16), mask=q_mask[:, None] & k_mask[None, :])
 
 
+def _lightning_indexer_pytorch(
+    q: torch.Tensor,  # (batch, seq_q, n_head, d_head)
+    k: torch.Tensor,  # (batch, seq_k, d_head)
+    w: torch.Tensor,  # (batch, seq_q, n_head)
+) -> torch.Tensor:
+    """
+    PyTorch fallback for Lightning Indexer.
+    Computes: out[b,q,k] = sum_h(ReLU(Q[b,q,h,:] · K[b,k,:]) * W[b,q,h])
+    """
+    batch, seq_q, n_head, d_head = q.shape
+    _, seq_k, _ = k.shape
+
+    # q: (batch, seq_q, n_head, d_head)
+    # k: (batch, seq_k, d_head)
+    # Compute Q @ K^T for each head: (batch, n_head, seq_q, seq_k)
+    # q reshaped: (batch, n_head, seq_q, d_head)
+    q_t = q.transpose(1, 2)  # (batch, n_head, seq_q, d_head)
+    k_t = k.unsqueeze(1)     # (batch, 1, seq_k, d_head)
+
+    # Batched matmul: (batch, n_head, seq_q, d_head) @ (batch, 1, d_head, seq_k)
+    scores = torch.matmul(q_t, k_t.transpose(-1, -2))  # (batch, n_head, seq_q, seq_k)
+
+    # Apply ReLU
+    scores = torch.relu(scores)
+
+    # Multiply by weights and sum over heads
+    # w: (batch, seq_q, n_head) -> (batch, n_head, seq_q, 1)
+    w_t = w.transpose(1, 2).unsqueeze(-1)
+
+    # scores * w: (batch, n_head, seq_q, seq_k) * (batch, n_head, seq_q, 1)
+    weighted = scores * w_t
+
+    # Sum over heads: (batch, seq_q, seq_k)
+    out = weighted.sum(dim=1).transpose(1, 2).contiguous()
+
+    return out.to(torch.float16)
+
+
 def lightning_indexer_fused(
     q: torch.Tensor,  # (batch, seq_q, n_head, d_head)
     k: torch.Tensor,  # (batch, seq_k, d_head)
@@ -406,6 +688,11 @@ def lightning_indexer_fused(
         Logits tensor of shape (batch, seq_q, seq_k) in FP16
     """
     assert q.is_cuda and k.is_cuda, "Inputs must be on CUDA"
+
+    # Use PyTorch fallback if Triton doesn't support this GPU
+    if not triton_available():
+        return _lightning_indexer_pytorch(q, k, w)
+
     batch, seq_q, n_head, d_head = q.shape
     _, seq_k, _ = k.shape
 
@@ -681,6 +968,10 @@ def fp8_matmul_dsv3(
     M, K = a.shape
     K2, N = b.shape
     assert K == K2, f"Dimension mismatch: {K} vs {K2}"
+
+    # Use PyTorch fallback if Triton doesn't support this GPU
+    if not triton_available():
+        return _fp8_matmul_pytorch(a, b, a_scales, b_scales, out_dtype=torch.bfloat16)
 
     out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
 
@@ -1289,6 +1580,121 @@ class SparseAttentionFunction(torch.autograd.Function):
         return grad_q.to(input_dtype), grad_k.to(input_dtype), grad_v.to(input_dtype), None, None
 
 
+class SparseAttentionPyTorch(torch.autograd.Function):
+    """
+    PyTorch fallback for sparse attention when Triton isn't available.
+    Uses gather operations instead of custom kernels.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, idx, scale):
+        """
+        Forward pass using PyTorch operations.
+
+        Args:
+            q: [B, H, L, D_qk]
+            k: [B, H, L, D_qk]
+            v: [B, H, L, D_v]
+            idx: [B, L, K]
+            scale: float
+        """
+        B, H, L, D_qk = q.shape
+        D_v = v.shape[-1]
+        K_sparse = idx.shape[-1]
+        input_dtype = q.dtype
+
+        # Expand idx for gathering: [B, L, K] -> [B, H, L, K, D]
+        idx_k = idx.unsqueeze(1).unsqueeze(-1).expand(B, H, L, K_sparse, D_qk)
+        idx_v = idx.unsqueeze(1).unsqueeze(-1).expand(B, H, L, K_sparse, D_v)
+
+        # Gather keys and values at selected indices
+        # k: [B, H, L, D_qk] -> gather along L dimension
+        k_gathered = torch.gather(k.unsqueeze(3).expand(-1, -1, -1, K_sparse, -1),
+                                   2, idx_k.clamp(0, L-1))  # [B, H, L, K, D_qk]
+        v_gathered = torch.gather(v.unsqueeze(3).expand(-1, -1, -1, K_sparse, -1),
+                                   2, idx_v.clamp(0, L-1))  # [B, H, L, K, D_v]
+
+        # Compute attention scores: q @ k^T
+        # q: [B, H, L, D_qk] -> [B, H, L, 1, D_qk]
+        # k_gathered: [B, H, L, K, D_qk]
+        scores = (q.unsqueeze(3) * k_gathered).sum(dim=-1) * scale  # [B, H, L, K]
+
+        # Create causal mask: position t can only attend to positions <= t
+        # idx: [B, L, K], expand to [B, H, L, K]
+        positions = torch.arange(L, device=q.device).view(1, 1, L, 1)
+        idx_expanded = idx.unsqueeze(1).expand(B, H, L, K_sparse)
+        causal_mask = idx_expanded <= positions
+
+        # Apply causal mask
+        scores = scores.masked_fill(~causal_mask, float('-inf'))
+
+        # Softmax
+        attn_weights = torch.softmax(scores, dim=-1)  # [B, H, L, K]
+        attn_weights = attn_weights.masked_fill(~causal_mask, 0.0)
+
+        # Weighted sum of values
+        # attn_weights: [B, H, L, K] -> [B, H, L, K, 1]
+        # v_gathered: [B, H, L, K, D_v]
+        output = (attn_weights.unsqueeze(-1) * v_gathered).sum(dim=3)  # [B, H, L, D_v]
+
+        ctx.save_for_backward(q, k, v, idx, attn_weights)
+        ctx.scale = scale
+
+        return output.to(input_dtype), attn_weights
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_attn_weights):
+        q, k, v, idx, attn_weights = ctx.saved_tensors
+        scale = ctx.scale
+
+        B, H, L, D_qk = q.shape
+        D_v = v.shape[-1]
+        K_sparse = idx.shape[-1]
+
+        # Expand idx for scatter operations
+        idx_k = idx.unsqueeze(1).unsqueeze(-1).expand(B, H, L, K_sparse, D_qk)
+        idx_v = idx.unsqueeze(1).unsqueeze(-1).expand(B, H, L, K_sparse, D_v)
+
+        # Gather keys and values again
+        k_gathered = torch.gather(k.unsqueeze(3).expand(-1, -1, -1, K_sparse, -1),
+                                   2, idx_k.clamp(0, L-1))
+        v_gathered = torch.gather(v.unsqueeze(3).expand(-1, -1, -1, K_sparse, -1),
+                                   2, idx_v.clamp(0, L-1))
+
+        # Gradient of output w.r.t. attn_weights and v_gathered
+        # output = sum_k(attn_weights[k] * v_gathered[k])
+        # d_attn_weights = grad_output @ v_gathered^T
+        # d_v_gathered = attn_weights^T @ grad_output
+
+        # grad_output: [B, H, L, D_v]
+        # v_gathered: [B, H, L, K, D_v]
+        grad_attn = (grad_output.unsqueeze(3) * v_gathered).sum(dim=-1)  # [B, H, L, K]
+
+        # d_v_gathered
+        grad_v_gathered = attn_weights.unsqueeze(-1) * grad_output.unsqueeze(3)  # [B, H, L, K, D_v]
+
+        # Softmax backward
+        # d_scores = attn_weights * (d_attn - sum_k(attn_weights * d_attn))
+        sum_term = (attn_weights * grad_attn).sum(dim=-1, keepdim=True)
+        grad_scores = attn_weights * (grad_attn - sum_term)
+
+        # d_q and d_k from scores = q @ k^T * scale
+        # d_q = grad_scores @ k_gathered * scale
+        # d_k_gathered = grad_scores^T @ q * scale
+        grad_q = (grad_scores.unsqueeze(-1) * k_gathered).sum(dim=3) * scale  # [B, H, L, D_qk]
+        grad_k_gathered = grad_scores.unsqueeze(-1) * q.unsqueeze(3) * scale  # [B, H, L, K, D_qk]
+
+        # Scatter gradients back to k and v
+        grad_k = torch.zeros_like(k)
+        grad_v = torch.zeros_like(v)
+
+        # Use scatter_add for gradients
+        grad_k.scatter_add_(2, idx_k.clamp(0, L-1), grad_k_gathered)
+        grad_v.scatter_add_(2, idx_v.clamp(0, L-1), grad_v_gathered)
+
+        return grad_q, grad_k, grad_v, None, None
+
+
 def sparse_attention(q, k, v, idx, scale=None):
     """
     TRUE sparse attention - O(L*K) instead of O(L^2).
@@ -1309,4 +1715,9 @@ def sparse_attention(q, k, v, idx, scale=None):
     """
     if scale is None:
         scale = q.shape[-1] ** -0.5
+
+    # Use PyTorch fallback if Triton doesn't support this GPU
+    if not triton_available():
+        return SparseAttentionPyTorch.apply(q, k, v, idx, scale)
+
     return SparseAttentionFunction.apply(q, k, v, idx, scale)

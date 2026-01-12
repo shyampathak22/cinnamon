@@ -726,10 +726,11 @@ if __name__ == "__main__":
         if rank == 0:
             print(f"Loaded checkpoint weights from {args.resume}")
     if train_config.use_fp8:
-        from kernels import convert_to_fp8
+        from kernels import convert_to_fp8, print_backend_status
         model = convert_to_fp8(model)
         if rank == 0:
             print("FP8 training enabled (SM89+ for compute benefits, otherwise storage-only)")
+            print_backend_status()
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     # torch.compile disabled - B300 (sm_103a) not yet supported by Triton
