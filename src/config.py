@@ -68,8 +68,8 @@ class TrainConfig:
     # Gamma schedule: γ=0.001→0.0 at 96.6% (DeepSeek V3: 14.3T/14.8T)
     gamma_final: float = 0.0
     gamma_switch_ratio: float = 0.966  # 96.6% of training
-    # DataLoader settings (tuned for 120 CPU B300 box)
-    num_workers: int = 32  # ~1/4 of CPUs, leave room for other processes
+    # DataLoader settings (tuned for 60 CPU 2x B300 box)
+    num_workers: int = 16  # ~1/4 of CPUs, leave room for other processes
     pin_memory: bool = True
     prefetch_factor: int = 8  # aggressive prefetch for large batches
     # FP8 training (requires SM89+ for compute benefits, otherwise storage-only)
