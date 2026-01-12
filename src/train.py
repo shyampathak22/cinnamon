@@ -733,7 +733,8 @@ if __name__ == "__main__":
             print_backend_status()
     model.to(local_rank)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    # torch.compile disabled - B300 (sm_103a) not yet supported by Triton
+    # torch.compile disabled - custom autograd Functions (SparseAttentionFunction) use
+    # .stride() in backward which dynamo can't trace. Triton kernels are already optimized.
     # model = torch.compile(model)
     if rank == 0:
         print("Initializing trainer...")

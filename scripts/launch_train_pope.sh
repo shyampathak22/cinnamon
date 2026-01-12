@@ -4,8 +4,8 @@
 # Phase 2: Full training at SEQ_LEN_FINAL=1024
 set -euo pipefail
 
-# Use system ptxas for Triton (required for Blackwell B300 sm_103a support)
-export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
+# Use CUDA 13+ ptxas for Triton (required for Blackwell B300 sm_103a support)
+export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda-13.0/bin/ptxas}"
 
 PROJECT="${WANDB_PROJECT:-cinnamon}"
 RUN_PREFIX="${RUN_PREFIX:-}"
@@ -32,13 +32,13 @@ DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1500}"
 #   Dense warmup (seq=512):  batch * 8 * 512^2 * 2 * 20 = batch * 84MB
 #   Sparse training (seq=1024, top-128): batch * 8 * 1024 * 128 * 2 * 20 = batch * 42MB
 # Sparse uses HALF the attention memory! So we can double batch after warmup.
-BATCH_SIZE="${BATCH_SIZE:-384}"          # ~32GB attn during dense warmup
-BATCH_SIZE_SPARSE="${BATCH_SIZE_SPARSE:-768}"  # ~32GB attn during sparse (same footprint!)
+BATCH_SIZE="${BATCH_SIZE:-128}"          # ~11GB attn during dense warmup
+BATCH_SIZE_SPARSE="${BATCH_SIZE_SPARSE:-256}"  # ~11GB attn during sparse
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 EVAL_STEPS="${EVAL_STEPS:-500}"
 CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-500}"  # Aggressive for spot instance
-# LR scaled with sqrt rule: 3e-4 * sqrt(384/24) = 3e-4 * 4 = 1.2e-3
-LR="${LR:-1.2e-3}"
+# LR scaled with sqrt rule: 3e-4 * sqrt(128/24) = 3e-4 * 2.31 = 6.9e-4
+LR="${LR:-6.9e-4}"
 
 # GPU config - single B300 per model (262GB VRAM is plenty for 200M)
 NUM_GPUS="${NUM_GPUS:-1}"

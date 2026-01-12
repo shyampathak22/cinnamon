@@ -32,6 +32,14 @@ echo ""
 echo "Checking CUDA..."
 uv run python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print(f'GPUs: {torch.cuda.device_count()}')"
 
+# Install CUDA 13 toolkit if not present (required for B300 sm_103a)
+if [[ ! -d "/usr/local/cuda-13.0" ]]; then
+    echo ""
+    echo "Installing CUDA 13.0 toolkit (required for B300 sm_103a)..."
+    apt install -y cuda-toolkit-13-0
+fi
+echo "CUDA 13 ptxas: $(/usr/local/cuda-13.0/bin/ptxas --version 2>/dev/null | head -1 || echo 'not found')"
+
 # Data preparation
 echo ""
 echo "=== Data Preparation ==="

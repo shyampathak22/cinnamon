@@ -38,11 +38,11 @@ echo ""
 echo "=== PHASE 1: PRETRAINING ==="
 echo ""
 
-CUDA_VISIBLE_DEVICES=0,1 MASTER_PORT=29500 "$SCRIPT_DIR/launch_train_rope.sh" &
+CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29500 "$SCRIPT_DIR/launch_train_rope.sh" &
 ROPE_PID=$!
 echo "Started RoPE training (PID: $ROPE_PID)"
 
-CUDA_VISIBLE_DEVICES=2,3 MASTER_PORT=29501 "$SCRIPT_DIR/launch_train_pope.sh" &
+CUDA_VISIBLE_DEVICES=1 MASTER_PORT=29501 "$SCRIPT_DIR/launch_train_pope.sh" &
 POPE_PID=$!
 echo "Started PoPE training (PID: $POPE_PID)"
 

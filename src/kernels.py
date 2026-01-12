@@ -15,6 +15,9 @@ import torch
 import triton
 import triton.language as tl
 import warnings
+import os
+import subprocess
+import shutil
 
 # FP8 E4M3 max representable value
 FP8_E4M3_MAX = tl.constexpr(448.0)
@@ -25,15 +28,36 @@ FP8_MAX_FLOAT = 448.0
 # =============================================================================
 
 _TRITON_AVAILABLE = None  # Lazy init
+_TRITON_ERROR = None  # Store error for diagnostics
+
+
+def _get_ptxas_version(ptxas_path: str) -> str | None:
+    """Get ptxas version string."""
+    try:
+        result = subprocess.run(
+            [ptxas_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        # Parse version from output like "ptxas: NVIDIA (R) Ptx optimizing assembler, version 12.8.93"
+        for line in result.stdout.split("\n"):
+            if "version" in line.lower():
+                return line.strip()
+        return result.stdout.strip()[:100] if result.stdout else None
+    except Exception:
+        return None
+
 
 def _check_triton_support():
     """Check if Triton supports the current GPU architecture."""
-    global _TRITON_AVAILABLE
+    global _TRITON_AVAILABLE, _TRITON_ERROR
     if _TRITON_AVAILABLE is not None:
         return _TRITON_AVAILABLE
 
     if not torch.cuda.is_available():
         _TRITON_AVAILABLE = False
+        _TRITON_ERROR = "CUDA not available"
         return False
 
     try:
@@ -52,13 +76,34 @@ def _check_triton_support():
         _test_kernel[(2,)](x, out, 64)
         torch.cuda.synchronize()
         _TRITON_AVAILABLE = True
+        _TRITON_ERROR = None
     except Exception as e:
-        if "sm_103" in str(e) or "ptxas" in str(e) or "gpu-name" in str(e):
-            warnings.warn(
-                f"Triton doesn't support this GPU architecture (likely Blackwell sm_103a). "
-                f"Falling back to PyTorch native FP8 ops. Error: {e}"
-            )
+        error_str = str(e)
         _TRITON_AVAILABLE = False
+        _TRITON_ERROR = error_str
+
+        # Always warn with full diagnostics for Blackwell debugging
+        props = torch.cuda.get_device_properties(0)
+        ptxas_path = os.environ.get("TRITON_PTXAS_PATH", "")
+        ptxas_version = _get_ptxas_version(ptxas_path) if ptxas_path else None
+        system_ptxas = shutil.which("ptxas")
+        system_ptxas_version = _get_ptxas_version(system_ptxas) if system_ptxas else None
+
+        warnings.warn(
+            f"\n[Triton] Kernel compilation failed on {props.name} (sm_{props.major}{props.minor}).\n"
+            f"  Error: {error_str[:200]}{'...' if len(error_str) > 200 else ''}\n"
+            f"  TRITON_PTXAS_PATH={ptxas_path or '(not set)'}\n"
+            f"  ptxas version: {ptxas_version or '(not found)'}\n"
+            f"  System ptxas: {system_ptxas or '(not found)'}\n"
+            f"  System ptxas version: {system_ptxas_version or '(not found)'}\n"
+            f"  Triton version: {triton.__version__}\n"
+            f"  PyTorch version: {torch.__version__}\n"
+            f"  \n"
+            f"  For Blackwell (sm_103a), ensure:\n"
+            f"    1. CUDA 12.8+ is installed with ptxas supporting sm_103a\n"
+            f"    2. Set TRITON_PTXAS_PATH=/path/to/cuda-12.8/bin/ptxas\n"
+            f"    3. Triton >= 3.2.0 (you have {triton.__version__})\n"
+        )
 
     return _TRITON_AVAILABLE
 
@@ -78,11 +123,39 @@ def print_backend_status():
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
             print(f"          GPU: {props.name} (compute capability {props.major}.{props.minor})")
+        if _TRITON_ERROR:
+            print(f"          Triton error: {_TRITON_ERROR[:100]}...")
 
 
 # =============================================================================
 # PyTorch Native FP8 Fallbacks (for Blackwell/sm_103a)
 # =============================================================================
+
+def _compute_pow2_scale(abs_max: torch.Tensor, fp8_max: float = FP8_MAX_FLOAT) -> torch.Tensor:
+    """
+    Compute power-of-2 scale: 2^ceil(log2(abs_max / fp8_max))
+
+    Uses frexp/ldexp to avoid torch.exp2/log2 which can trigger NVRTC JIT
+    compilation on unsupported GPU architectures (like Blackwell sm_103a).
+
+    frexp(x) returns (mantissa, exponent) where x = mantissa * 2^exponent
+    and 0.5 <= |mantissa| < 1 (or mantissa=0 for x=0).
+
+    For ratio = abs_max / fp8_max:
+      log2(ratio) = log2(mantissa) + exponent, where log2(mantissa) in [-1, 0)
+      So log2(ratio) is in [exponent-1, exponent)
+      ceil(log2(ratio)) = exponent - 1 if mantissa == 0.5 (exact power of 2)
+                        = exponent otherwise
+      2^ceil(log2(ratio)) = ldexp(1, ceil_exponent)
+    """
+    ratio = abs_max / fp8_max
+    mantissa, exponent = torch.frexp(ratio)
+    # mantissa == 0.5 means ratio is an exact power of 2
+    ceil_exponent = torch.where(mantissa == 0.5, exponent - 1, exponent)
+    # ldexp(1.0, n) = 2^n
+    scales = torch.ldexp(torch.ones_like(ratio), ceil_exponent)
+    return scales
+
 
 def _quantize_fp8_rowwise_pytorch(x: torch.Tensor, block_size: int = 128, round_scale: bool = False):
     """
@@ -106,8 +179,8 @@ def _quantize_fp8_rowwise_pytorch(x: torch.Tensor, block_size: int = 128, round_
     abs_max = x_blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)  # (M, num_blocks, 1)
 
     if round_scale:
-        # Power-of-2 scaling
-        scales = torch.exp2(torch.ceil(torch.log2(abs_max / FP8_MAX_FLOAT)))
+        # Power-of-2 scaling using frexp/ldexp to avoid NVRTC JIT issues
+        scales = _compute_pow2_scale(abs_max, FP8_MAX_FLOAT)
     else:
         scales = abs_max / FP8_MAX_FLOAT
 
@@ -148,7 +221,8 @@ def _quantize_fp8_blockwise_pytorch(x: torch.Tensor, block_m: int = 128, block_n
     abs_max = x_blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-4)
 
     if round_scale:
-        scales = torch.exp2(torch.ceil(torch.log2(abs_max / FP8_MAX_FLOAT)))
+        # Power-of-2 scaling using frexp/ldexp to avoid NVRTC JIT issues
+        scales = _compute_pow2_scale(abs_max, FP8_MAX_FLOAT)
     else:
         scales = abs_max / FP8_MAX_FLOAT
 
