@@ -47,14 +47,18 @@ MAX_TOKENS="${MAX_TOKENS:-2500000000}"
 SEQ_LEN="${SEQ_LEN:-512}"
 SEQ_LEN_FINAL="${SEQ_LEN_FINAL:-1024}"
 
-# Shorter DSA warmup for recalibration (10% of original)
-DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1000}"
+# Shorter DSA warmup for recalibration (proportional to 10% token budget)
+# 25M tokens / (384 * 512) = ~130 steps
+DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-150}"
 
-BATCH_SIZE="${BATCH_SIZE:-24}"
+# B300 (262GB VRAM): same batch scaling as pretrain
+BATCH_SIZE="${BATCH_SIZE:-384}"
+BATCH_SIZE_SPARSE="${BATCH_SIZE_SPARSE:-768}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 EVAL_STEPS="${EVAL_STEPS:-200}"
 CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-200}"
-LR="${LR:-1e-4}"  # Lower LR for recalibration
+# Lower LR for recalibration (1/3 of pretrain LR)
+LR="${LR:-4e-4}"
 
 NUM_GPUS="${NUM_GPUS:-1}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -75,6 +79,7 @@ args=(
     --seq-len "$SEQ_LEN"
     --max-seq-len "$SEQ_LEN"
     --batch-size "$BATCH_SIZE"
+    --batch-size-sparse "$BATCH_SIZE_SPARSE"
     --accumulation-steps "$ACCUMULATION_STEPS"
     --eval-steps "$EVAL_STEPS"
     --checkpoint-steps "$CHECKPOINT_STEPS"

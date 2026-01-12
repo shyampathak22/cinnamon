@@ -250,12 +250,17 @@ class Trainer():
         )
 
     def _set_seq_len(self, seq_len):
+        old_seq_len = self.config.seq_len
         self.config.seq_len = seq_len
-        # Adjust batch size for seq_len change
-        # 512→1024: bs/12, accum*8 (warmup bs=24,accum=1 → sparse bs=2,accum=8)
-        if seq_len > 512:
-            self.config.batch_size = max(1, self.config.batch_size // 12)
-            self.config.accumulation_steps = self.config.accumulation_steps * 8
+        # With sparse attention (DSA), memory at seq=1024 is actually LESS than dense at seq=512:
+        #   Dense 512:  batch * heads * 512 * 512 = O(262k) per head
+        #   Sparse 1024 (top-128): batch * heads * 1024 * 128 = O(131k) per head
+        # So we can INCREASE batch when switching to sparse!
+        # batch_size_sparse defaults to 2x batch_size (same memory footprint)
+        if seq_len > old_seq_len and hasattr(self.config, 'batch_size_sparse') and self.config.batch_size_sparse:
+            self.config.batch_size = self.config.batch_size_sparse
+            if self.rank == 0:
+                print(f"  Batch size increased to {self.config.batch_size} for sparse attention")
         self.train_loader = self._build_loader("train", seq_len)
         self.val_loader = self._build_loader("val", seq_len)
         self.tokens_per_step = self.config.batch_size * self.config.seq_len * self.config.accumulation_steps
@@ -572,6 +577,8 @@ if __name__ == "__main__":
     parser.add_argument('--mscale', type=float, default=None)
     parser.add_argument('--max-tokens', type=int, default=None)
     parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--batch-size-sparse', type=int, default=None,
+                        help='Batch size after DSA warmup (sparse attention uses less memory)')
     parser.add_argument('--accumulation-steps', type=int, default=None)
     parser.add_argument('--seq-len-final', type=int, default=None)
     parser.add_argument('--eval-steps', type=int, default=None)
@@ -610,6 +617,8 @@ if __name__ == "__main__":
         train_config.max_tokens = args.max_tokens
     if args.batch_size is not None:
         train_config.batch_size = args.batch_size
+    if args.batch_size_sparse is not None:
+        train_config.batch_size_sparse = args.batch_size_sparse
     if args.accumulation_steps is not None:
         train_config.accumulation_steps = args.accumulation_steps
     if args.eval_steps is not None:

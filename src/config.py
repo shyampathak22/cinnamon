@@ -44,6 +44,7 @@ class TrainConfig:
     lr: float = 3e-4  # restored after adding RoPE projection norms
     max_tokens: int = 25_000_000_000  # 25B tokens
     batch_size: int = 2
+    batch_size_sparse: int | None = None  # batch size after DSA warmup (sparse attn uses less mem)
     accumulation_steps: int = 32  # effective batch = 2*32*1024 = 65k tokens/step
     seq_len: int = 1024  # training context length (align with ModelConfig)
     seq_len_final: int | None = None  # optional post-warmup seq len

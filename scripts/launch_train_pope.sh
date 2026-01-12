@@ -22,18 +22,24 @@ SEQ_LEN="${SEQ_LEN:-512}"
 SEQ_LEN_FINAL="${SEQ_LEN_FINAL:-1024}"
 
 # DSA warmup: ~1% of training (conservative for from-scratch joint training)
-# 245M tokens / (24 * 1 * 512 * 2 GPUs) = ~10k steps
-DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-10000}"
+# 250M tokens / (384 * 1 * 512 * 1 GPU) = ~1.3k steps at seq=512
+DSA_WARMUP_STEPS="${DSA_WARMUP_STEPS:-1500}"
 
-BATCH_SIZE="${BATCH_SIZE:-24}"  # Divides by 12 to 2 when seq_len switches to 1024
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"  # Multiplies by 8 to 8 when seq_len switches
+# B300 (262GB VRAM): Memory calculation
+#   Dense warmup (seq=512):  batch * 8 * 512^2 * 2 * 20 = batch * 84MB
+#   Sparse training (seq=1024, top-128): batch * 8 * 1024 * 128 * 2 * 20 = batch * 42MB
+# Sparse uses HALF the attention memory! So we can double batch after warmup.
+BATCH_SIZE="${BATCH_SIZE:-384}"          # ~32GB attn during dense warmup
+BATCH_SIZE_SPARSE="${BATCH_SIZE_SPARSE:-768}"  # ~32GB attn during sparse (same footprint!)
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 EVAL_STEPS="${EVAL_STEPS:-500}"
 CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-500}"  # Aggressive for spot instance
-LR="${LR:-3e-4}"
+# LR scaled with sqrt rule: 3e-4 * sqrt(384/24) = 3e-4 * 4 = 1.2e-3
+LR="${LR:-1.2e-3}"
 
-# GPU config - default to GPUs 2,3 for PoPE
-NUM_GPUS="${NUM_GPUS:-2}"
-CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
+# GPU config - single B300 per model (262GB VRAM is plenty for 200M)
+NUM_GPUS="${NUM_GPUS:-1}"
+CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 
 args=(
@@ -44,6 +50,7 @@ args=(
   --seq-len "$SEQ_LEN"
   --max-seq-len "$SEQ_LEN"
   --batch-size "$BATCH_SIZE"
+  --batch-size-sparse "$BATCH_SIZE_SPARSE"
   --accumulation-steps "$ACCUMULATION_STEPS"
   --eval-steps "$EVAL_STEPS"
   --checkpoint-steps "$CHECKPOINT_STEPS"
